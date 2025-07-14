@@ -13,12 +13,9 @@ app.use(express.json());
 const uri = 'mongodb+srv://studyadmin:s1ywzQlamDlNFgcI@studyhelp.mi5j40t.mongodb.net/studyhelp?retryWrites=true&w=majority&appName=studyhelp';
 
 // Connect to MongoDB
-mongoose.connect(uri, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-})
-.then(() => console.log('✅ Connected to MongoDB Atlas'))
-.catch(err => console.error('❌ Connection error:', err));
+mongoose.connect(uri)
+  .then(() => console.log('✅ Connected to MongoDB Atlas'))
+  .catch(err => console.error('❌ Connection error:', err));
 
 // Define Schema
 const studentSchema = new mongoose.Schema({
@@ -31,12 +28,11 @@ const studentSchema = new mongoose.Schema({
 
 const Student = mongoose.model('Student', studentSchema);
 
-// API endpoint to receive form data
+// Registration endpoint
 app.post('/register', async (req, res) => {
   try {
     const { name, roll, department, year, cin } = req.body;
 
-    // 🔍 Check if CIN or Roll already exists
     const existingUser = await Student.findOne({
       $or: [{ cin }, { roll }]
     });
@@ -45,7 +41,6 @@ app.post('/register', async (req, res) => {
       return res.status(400).send('❌ CIN or Roll number already registered');
     }
 
-    // ✅ If not found, create new student
     const student = new Student({ name, roll, department, year, cin });
     await student.save();
     res.status(201).send('✅ Registration successful');
@@ -55,6 +50,8 @@ app.post('/register', async (req, res) => {
     res.status(500).send('❌ Server error');
   }
 });
+
+// Login endpoint
 app.post('/login', async (req, res) => {
   const { name, cin } = req.body;
 
@@ -76,8 +73,11 @@ app.post('/login', async (req, res) => {
   }
 });
 
+// ✅ Test route for pinging
+app.get('/', (req, res) => {
+  res.send('✅ StudyHelp backend is running');
+});
 
-
-// Start the server
-const PORT = 5000;
-app.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`));
+// ✅ Start the server on correct port
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
