@@ -34,7 +34,7 @@ app.post('/register', async (req, res) => {
     const { name, roll, department, year, cin } = req.body;
 
     const existingUser = await Student.findOne({
-      $or: [{ cin }, { roll }]
+      $or: [{ cin }]
     });
 
     if (existingUser) {
