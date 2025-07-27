@@ -40,8 +40,8 @@ app.post('/register', async (req, res) => {
     if (existingUser) {
       return res.status(400).send('❌ CIN already registered.Please go to Sign in');
     }
-
-    const student = new Student({ name, roll, department, year, cin });
+    const trimmedName = name.trim();
+    const student = new Student({ name: trimmedName, roll, department, year, cin });
     await student.save();
     res.status(201).send('✅ Registration successful');
 
@@ -61,8 +61,8 @@ app.post('/login', async (req, res) => {
     if (!userByCin) {
       return res.status(401).send('❌ CIN not found');
     }
-
-    if (userByCin.name !== name) {
+    const trimmedName = name.trim();
+    if (userByCin.name !== trimmedName) {
       return res.status(401).send('❌ Name doesn\'t match with CIN');
     }
 
