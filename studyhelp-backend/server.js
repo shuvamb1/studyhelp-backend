@@ -38,7 +38,7 @@ app.post('/register', async (req, res) => {
     });
 
     if (existingUser) {
-      return res.status(400).send('❌ CIN or Roll number already registered.Please go to Sign in');
+      return res.status(400).send('❌ CIN already registered.Please go to Sign in');
     }
 
     const student = new Student({ name, roll, department, year, cin });
