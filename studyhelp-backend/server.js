@@ -79,5 +79,13 @@ app.get('/', (req, res) => {
 });
 
 // ✅ Start the server on correct port
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+const PORT = process.env.PORT;
+if (!PORT) {
+  console.error("❌ PORT not set! Did you run locally?");
+  process.exit(1);
+}
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
+
