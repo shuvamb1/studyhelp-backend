@@ -14,13 +14,24 @@ const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5500,http:
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  if (allowedOrigins.includes(origin)) return true;
+
+  try {
+    const { hostname } = new URL(origin);
+    if (hostname.endsWith('.github.io')) return true;
+    if (hostname === 'localhost' || hostname === '127.0.0.1') return true;
+  } catch (err) {
+    return false;
+  }
+
+  return false;
+};
+
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-      return;
-    }
-    callback(null, false);
+    callback(null, isAllowedOrigin(origin));
   }
 }));
 app.use(express.json());
