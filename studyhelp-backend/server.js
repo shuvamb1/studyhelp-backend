@@ -415,5 +415,234 @@ app.post('/api/admin/notices', authMiddleware, adminMiddleware, async (req, res)
   }
 });
 
+const mockTestPaperSchema = new mongoose.Schema({
+  title: String,
+  subject: String,
+  department: String,
+  semester: String,
+  year: String,
+  duration: { type: Number, default: 60 },
+  totalQuestions: { type: Number, default: 0 },
+  totalMarks: { type: Number, default: 0 },
+  pdfUrl: String,
+  pdfFilePath: String,
+  status: { type: String, default: 'active' },
+  createdAt: { type: Date, default: Date.now }
+});
+const MockTestPaper = mongoose.model('MockTestPaper', mockTestPaperSchema);
+
+const mockQuestionSchema = new mongoose.Schema({
+  paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper' },
+  question: String,
+  options: [String],
+  correctAnswer: Number,
+  marks: { type: Number, default: 1 },
+  difficulty: { type: String, enum: ['easy', 'medium', 'hard'], default: 'medium' },
+  topic: String,
+  createdAt: { type: Date, default: Date.now }
+});
+const MockQuestion = mongoose.model('MockQuestion', mockQuestionSchema);
+
+const mockTestResultSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'Student' },
+  paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper' },
+  answers: [{ questionId: mongoose.Schema.Types.ObjectId, selectedOption: Number }],
+  score: Number,
+  totalMarks: Number,
+  correctCount: Number,
+  wrongCount: Number,
+  unansweredCount: Number,
+  timeTaken: Number,
+  completedAt: { type: Date, default: Date.now }
+});
+const MockTestResult = mongoose.model('MockTestResult', mockTestResultSchema);
+
+// ========== MOCK TEST API ROUTES ==========
+
+// Admin: Upload PDF and create paper
+app.post('/api/admin/mock-tests/upload', authMiddleware, adminMiddleware, upload.single('pdf'), async (req, res) => {
+  try {
+    const { title, subject, department, semester, year, duration } = req.body;
+    const paper = new MockTestPaper({
+      title, subject, department, semester, year,
+      duration: Number(duration) || 60,
+      pdfFilePath: req.file ? req.file.path : '',
+      pdfUrl: req.file ? `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}` : ''
+    });
+    await paper.save();
+    res.status(201).json({ message: 'Paper uploaded. Now add questions.', paper });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to upload paper' });
+  }
+});
+
+// Admin: Add questions to a paper
+app.post('/api/admin/mock-tests/:id/questions', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const paper = await MockTestPaper.findById(req.params.id);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+
+    const questions = req.body.questions;
+    if (!Array.isArray(questions) || questions.length === 0) {
+      return res.status(400).json({ error: 'Questions array required' });
+    }
+
+    const docs = questions.map(q => ({
+      paperId: paper._id,
+      question: q.question,
+      options: q.options,
+      correctAnswer: q.correctAnswer,
+      marks: q.marks || 1,
+      difficulty: q.difficulty || 'medium',
+      topic: q.topic || ''
+    }));
+
+    await MockQuestion.insertMany(docs);
+    const count = await MockQuestion.countDocuments({ paperId: paper._id });
+    const totalMarks = await MockQuestion.aggregate([
+      { $match: { paperId: paper._id } },
+      { $group: { _id: null, total: { $sum: '$marks' } } }
+    ]);
+
+    paper.totalQuestions = count;
+    paper.totalMarks = totalMarks.length > 0 ? totalMarks[0].total : 0;
+    await paper.save();
+
+    res.json({ success: true, totalQuestions: count, totalMarks: paper.totalMarks });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to add questions' });
+  }
+});
+
+// Admin: List all papers
+app.get('/api/admin/mock-tests', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const papers = await MockTestPaper.find().sort({ createdAt: -1 }).select('-__v');
+    res.json(papers);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin: Delete a paper
+app.delete('/api/admin/mock-tests/:id', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    await MockQuestion.deleteMany({ paperId: req.params.id });
+    await MockTestResult.deleteMany({ paperId: req.params.id });
+    const paper = await MockTestPaper.findByIdAndDelete(req.params.id);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin: Get questions for a paper
+app.get('/api/admin/mock-tests/:id/questions', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const questions = await MockQuestion.find({ paperId: req.params.id }).select('-__v');
+    res.json(questions);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// User: List available papers
+app.get('/api/mock-tests/papers', authMiddleware, async (req, res) => {
+  try {
+    const papers = await MockTestPaper.find({ status: 'active' }).select('-__v');
+    res.json(papers);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// User: Get questions for a paper (randomized, for test)
+app.get('/api/mock-tests/:id/questions', authMiddleware, async (req, res) => {
+  try {
+    const paper = await MockTestPaper.findById(req.params.id);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+
+    const questions = await MockQuestion.find({ paperId: req.params.id }).select('-correctAnswer -__v');
+    // Shuffle questions
+    const shuffled = questions.sort(() => 0.5 - Math.random());
+    res.json({ paper, questions: shuffled });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// User: Submit test
+app.post('/api/mock-tests/:id/submit', authMiddleware, async (req, res) => {
+  try {
+    const paper = await MockTestPaper.findById(req.params.id);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+
+    const questions = await MockQuestion.find({ paperId: req.params.id });
+    const answers = req.body.answers || [];
+
+    let score = 0, correct = 0, wrong = 0, unanswered = 0;
+
+    const answerMap = {};
+    answers.forEach(a => { answerMap[a.questionId] = a.selectedOption; });
+
+    const detailedResults = questions.map(q => {
+      const selected = answerMap[q._id.toString()];
+      const isCorrect = selected === q.correctAnswer;
+      const isUnanswered = selected === undefined || selected === null;
+
+      if (isCorrect) { score += q.marks; correct++; }
+      else if (isUnanswered) { unanswered++; }
+      else { wrong++; }
+
+      return {
+        questionId: q._id,
+        question: q.question,
+        options: q.options,
+        correctAnswer: q.correctAnswer,
+        selectedOption: selected,
+        isCorrect,
+        marks: q.marks
+      };
+    });
+
+    const result = new MockTestResult({
+      userId: req.user.id,
+      paperId: req.params.id,
+      answers: answers.map(a => ({ questionId: a.questionId, selectedOption: a.selectedOption })),
+      score,
+      totalMarks: paper.totalMarks,
+      correctCount: correct,
+      wrongCount: wrong,
+      unansweredCount: unanswered,
+      timeTaken: req.body.timeTaken || 0
+    });
+    await result.save();
+
+    res.json({
+      score, totalMarks: paper.totalMarks, correctCount: correct, wrongCount: wrong, unansweredCount: unanswered,
+      timeTaken: req.body.timeTaken || 0, percentage: ((score / paper.totalMarks) * 100).toFixed(2),
+      detailedResults
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// User: Get test results
+app.get('/api/mock-tests/results', authMiddleware, async (req, res) => {
+  try {
+    const results = await MockTestResult.find({ userId: req.user.id })
+      .populate('paperId', 'title subject department semester')
+      .sort({ completedAt: -1 });
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
