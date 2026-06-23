@@ -460,7 +460,7 @@ const MockQuestion = mongoose.model('MockQuestion', mockQuestionSchema);
 const mockTestResultSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'Student' },
   paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper' },
-  answers: [{ questionId: mongoose.Schema.Types.ObjectId, selectedOption: Number }],
+  answers: [{ questionId: { type: mongoose.Schema.Types.Mixed }, selectedOption: Number }],
   score: Number,
   totalMarks: Number,
   correctCount: Number,
@@ -470,6 +470,24 @@ const mockTestResultSchema = new mongoose.Schema({
   completedAt: { type: Date, default: Date.now }
 });
 const MockTestResult = mongoose.model('MockTestResult', mockTestResultSchema);
+
+// Ephemeral test session (stores AI-generated questions per test attempt, auto-expires)
+const testSessionSchema = new mongoose.Schema({
+  paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper' },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'Student' },
+  questions: [{
+    question: String,
+    options: [String],
+    correctAnswer: Number,
+    marks: Number,
+    difficulty: String,
+    topic: String
+  }],
+  totalMarks: Number,
+  duration: Number,
+  createdAt: { type: Date, default: Date.now, expires: 7200 } // auto-delete after 2 hours
+});
+const TestSession = mongoose.model('TestSession', testSessionSchema);
 
 // ========== AI QUESTION GENERATION HELPERS ==========
 
@@ -718,18 +736,16 @@ app.post('/api/admin/mock-tests/upload', authMiddleware, adminMiddleware, upload
 // Admin: Create a new paper (without PDF)
 app.post('/api/admin/mock-tests/papers', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { title, subject, department, semester, year, totalMarks, duration } = req.body;
+    const { title, subject, department, semester, year } = req.body;
     const paper = new MockTestPaper({
       title,
       subject,
       department,
       semester,
-      year,
-      totalMarks: Number(totalMarks) || 0,
-      duration: Number(duration) || 60
+      year
     });
     await paper.save();
-    res.status(201).json({ message: 'Paper created successfully. Now upload PYQ PDFs to it.', paper });
+    res.status(201).json({ message: 'Paper created successfully. Upload PYQ PDFs to it.', paper });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to create paper' });
@@ -924,47 +940,190 @@ app.post('/api/admin/mock-tests/:id/generate', authMiddleware, adminMiddleware, 
   }
 });
 
-// User: List available papers
+// User: List available papers (any paper with at least one PDF)
 app.get('/api/mock-tests/papers', authMiddleware, async (req, res) => {
   try {
-    const papers = await MockTestPaper.find({ status: 'active', totalQuestions: { $gt: 0 } }).select('-__v');
-    res.json(papers);
+    const papers = await MockTestPaper.find({ status: 'active' }).select('-__v');
+    // Only return papers that have at least one PDF (new pdfFiles or legacy pdfUrl)
+    const available = papers.filter(p => {
+      if (p.pdfFiles && p.pdfFiles.length > 0) return true;
+      if (p.pdfUrl || p.pdfFilePath) return true;
+      return false;
+    });
+    res.json(available);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// User: Get questions for a paper (randomized, for test)
-app.get('/api/mock-tests/:id/questions', authMiddleware, async (req, res) => {
+// User: Start a test — generates questions from PDFs on demand using AI
+app.post('/api/mock-tests/:id/start', authMiddleware, async (req, res) => {
   try {
     const paper = await MockTestPaper.findById(req.params.id);
     if (!paper) return res.status(404).json({ error: 'Paper not found' });
 
-    const questions = await MockQuestion.find({ paperId: req.params.id }).select('-correctAnswer -__v');
-    // Shuffle questions
-    const shuffled = questions.sort(() => 0.5 - Math.random());
-    res.json({ paper, questions: shuffled });
+    const { marks, duration } = req.body;
+    const totalMarks = Number(marks) || 30;
+    const testDuration = Number(duration) || 60;
+
+    if (!aiEnabled) {
+      return res.status(400).json({ error: 'AI is not configured on this server. Please contact admin.' });
+    }
+
+    // Extract text from all PDFs
+    const extractResult = await extractTextFromAllPDFs(paper);
+    if (!extractResult.success) {
+      return res.status(400).json({ error: extractResult.error });
+    }
+
+    let combinedText = extractResult.text;
+    const MAX_CHARS = 12000;
+    if (combinedText.length > MAX_CHARS) {
+      combinedText = combinedText.substring(0, MAX_CHARS) + '\n\n[Additional content truncated...]';
+    }
+
+    const prompt = `You are an expert exam question generator. I have provided you with the text content of one or more previous year exam papers (PYQs). Your task is to generate a complete set of multiple-choice questions for a mock test based on these papers.
+
+EXAM DETAILS:
+- Paper Name: ${paper.title}
+- Subject: ${paper.subject || 'N/A'}
+- Department: ${paper.department || 'N/A'}
+- Semester: ${paper.semester || 'N/A'}
+- Total Marks Required: ${totalMarks}
+- Duration: ${testDuration} minutes
+- Target: approximately ${totalMarks} marks worth of questions (typically 1 mark per question, some 2-mark questions for complex topics)
+
+INSTRUCTIONS:
+1. Read through ALL the provided PYQ content carefully.
+2. Generate a complete set of multiple-choice questions for a ${totalMarks}-mark exam on "${paper.title}" lasting ${testDuration} minutes.
+3. The total marks of ALL generated questions should closely match ${totalMarks} marks.
+4. For each question:
+   - Include some EXACT same questions from the PYQs if they are suitable as multiple-choice questions
+   - Also create NEW similar questions that test the same concepts and topics (vary wording, numbers, or scenarios)
+   - Each question must have exactly 4 options (A, B, C, D)
+   - Mark the correct answer with a 0-based index (0=A, 1=B, 2=C, 3=D)
+   - Assign marks per question: typically 1 mark per question, 2 marks for more complex/computational questions
+   - Include difficulty level: easy, medium, or hard
+   - Include a topic tag for each question
+5. Ensure questions cover ALL major topics from the PYQs evenly
+6. Vary question types: conceptual, definitional, application-based, numerical where applicable
+7. Return ONLY a valid JSON array with NO markdown formatting, NO code blocks, NO explanation text outside the JSON
+
+PREVIOUS YEAR EXAM PAPER CONTENT:
+${combinedText}
+
+JSON FORMAT (return ONLY this array, no other text):
+[
+  {
+    "question": "Question text here",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correctAnswer": 0,
+    "marks": 1,
+    "difficulty": "medium",
+    "topic": "topic name"
+  }
+]`;
+
+    const aiResponse = await callAI(prompt);
+    if (!aiResponse) {
+      return res.status(500).json({ error: 'AI generation failed. Please check AI configuration or try again.' });
+    }
+
+    // Clean up response
+    let cleanedResponse = aiResponse.trim();
+    if (cleanedResponse.startsWith('```json')) {
+      cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+    } else if (cleanedResponse.startsWith('```')) {
+      cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
+    }
+    cleanedResponse = cleanedResponse.trim();
+
+    let rawQuestions;
+    try {
+      rawQuestions = JSON.parse(cleanedResponse);
+    } catch (parseErr) {
+      console.error('AI JSON parse error:', parseErr.message);
+      return res.status(500).json({ error: 'AI returned invalid format. Please try again.' });
+    }
+
+    if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+      return res.status(500).json({ error: 'AI generated no questions. Please try again.' });
+    }
+
+    // Validate and store
+    const questions = [];
+    let actualTotalMarks = 0;
+    for (const q of rawQuestions) {
+      if (!q.question || !Array.isArray(q.options) || q.options.length !== 4) continue;
+      if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+      const qMarks = Number(q.marks) || 1;
+      questions.push({
+        question: q.question.trim(),
+        options: q.options.map(o => String(o).trim()),
+        correctAnswer: Math.round(q.correctAnswer),
+        marks: qMarks,
+        difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
+        topic: q.topic || ''
+      });
+      actualTotalMarks += qMarks;
+    }
+
+    if (questions.length === 0) {
+      return res.status(500).json({ error: 'No valid questions generated. Please try again.' });
+    }
+
+    // Create ephemeral session
+    const session = new TestSession({
+      paperId: paper._id,
+      userId: req.user.id,
+      questions,
+      totalMarks: actualTotalMarks,
+      duration: testDuration
+    });
+    await session.save();
+
+    // Return questions without correct answers to client
+    const clientQuestions = questions.map((q, idx) => ({
+      id: idx,
+      question: q.question,
+      options: q.options,
+      marks: q.marks,
+      difficulty: q.difficulty,
+      topic: q.topic
+    }));
+
+    res.json({
+      testId: session._id,
+      paper: { title: paper.title, subject: paper.subject, department: paper.department, semester: paper.semester },
+      questions: clientQuestions,
+      totalMarks: actualTotalMarks,
+      duration: testDuration,
+      questionCount: questions.length
+    });
   } catch (err) {
-    res.status(500).json({ error: 'Server error' });
+    console.error('Start test error:', err);
+    res.status(500).json({ error: 'Server error during test generation' });
   }
 });
 
-// User: Submit test
+// User: Submit test (uses ephemeral TestSession)
 app.post('/api/mock-tests/:id/submit', authMiddleware, async (req, res) => {
   try {
-    const paper = await MockTestPaper.findById(req.params.id);
-    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+    const { testId, answers, timeTaken } = req.body;
+    if (!testId) return res.status(400).json({ error: 'Test ID required' });
 
-    const questions = await MockQuestion.find({ paperId: req.params.id });
-    const answers = req.body.answers || [];
+    const session = await TestSession.findById(testId);
+    if (!session) return res.status(400).json({ error: 'Test session expired or not found. Please start a new test.' });
+
+    const questions = session.questions;
+    const userAnswers = answers || [];
 
     let score = 0, correct = 0, wrong = 0, unanswered = 0;
-
     const answerMap = {};
-    answers.forEach(a => { answerMap[a.questionId] = a.selectedOption; });
+    userAnswers.forEach(a => { answerMap[a.questionId] = a.selectedOption; });
 
-    const detailedResults = questions.map(q => {
-      const selected = answerMap[q._id.toString()];
+    const detailedResults = questions.map((q, idx) => {
+      const selected = answerMap[idx];
       const isCorrect = selected === q.correctAnswer;
       const isUnanswered = selected === undefined || selected === null;
 
@@ -973,7 +1132,7 @@ app.post('/api/mock-tests/:id/submit', authMiddleware, async (req, res) => {
       else { wrong++; }
 
       return {
-        questionId: q._id,
+        questionId: idx,
         question: q.question,
         options: q.options,
         correctAnswer: q.correctAnswer,
@@ -986,23 +1145,31 @@ app.post('/api/mock-tests/:id/submit', authMiddleware, async (req, res) => {
     const result = new MockTestResult({
       userId: req.user.id,
       paperId: req.params.id,
-      answers: answers.map(a => ({ questionId: a.questionId, selectedOption: a.selectedOption })),
+      answers: userAnswers.map(a => ({ questionId: a.questionId, selectedOption: a.selectedOption })),
       score,
-      totalMarks: paper.totalMarks,
+      totalMarks: session.totalMarks,
       correctCount: correct,
       wrongCount: wrong,
       unansweredCount: unanswered,
-      timeTaken: req.body.timeTaken || 0
+      timeTaken: timeTaken || 0
     });
     await result.save();
 
+    // Clean up session
+    await TestSession.findByIdAndDelete(testId);
+
     res.json({
-      score, totalMarks: paper.totalMarks, correctCount: correct, wrongCount: wrong, unansweredCount: unanswered,
-      timeTaken: req.body.timeTaken || 0, percentage: ((score / paper.totalMarks) * 100).toFixed(2),
+      score,
+      totalMarks: session.totalMarks,
+      correctCount: correct,
+      wrongCount: wrong,
+      unansweredCount: unanswered,
+      timeTaken: timeTaken || 0,
+      percentage: session.totalMarks > 0 ? ((score / session.totalMarks) * 100).toFixed(2) : '0.00',
       detailedResults
     });
   } catch (err) {
-    console.error(err);
+    console.error('Submit error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
