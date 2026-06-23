@@ -429,10 +429,17 @@ const mockTestPaperSchema = new mongoose.Schema({
   semester: String,
   year: String,
   duration: { type: Number, default: 60 },
-  totalQuestions: { type: Number, default: 0 },
   totalMarks: { type: Number, default: 0 },
-  pdfUrl: String,
-  pdfFilePath: String,
+  totalQuestions: { type: Number, default: 0 },
+  pdfFiles: [{
+    filename: String,
+    originalName: String,
+    path: String,
+    url: String,
+    uploadedAt: { type: Date, default: Date.now }
+  }],
+  pdfUrl: String,       // legacy single PDF (kept for backward compat)
+  pdfFilePath: String,  // legacy single PDF (kept for backward compat)
   status: { type: String, default: 'active' },
   createdAt: { type: Date, default: Date.now }
 });
@@ -498,173 +505,95 @@ async function callAI(prompt) {
   }
 }
 
-// ===== FREE FALLBACK QUESTION GENERATOR =====
-// Uses basic text analysis to create MCQ questions from PDF content without any API key.
-function fallbackGenerateQuestions(text, title, subject) {
-  const sentences = text.split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 30 && s.length < 300);
-  const paragraphs = text.split(/\n\n+/).map(p => p.trim()).filter(p => p.length > 50);
-  const keywords = extractKeywords(text);
-  const questions = [];
-  const used = new Set();
+// Extract text from all PDFs belonging to a paper
+async function extractTextFromAllPDFs(paper) {
+  const texts = [];
+  const pdfFiles = [];
 
-  // Helper to create distractors
-  const makeDistractors = (correct, allKeywords) => {
-    const opts = [correct];
-    const candidates = allKeywords.filter(k => k !== correct && k.length > 2 && k.length < 40).slice(0, 20);
-    for (let i = 0; i < candidates.length && opts.length < 4; i++) {
-      if (!opts.includes(candidates[i])) opts.push(candidates[i]);
+  // Collect all PDF paths (both new pdfFiles array and legacy single pdf)
+  if (paper.pdfFiles && paper.pdfFiles.length > 0) {
+    for (const pdf of paper.pdfFiles) {
+      if (pdf.path && fs.existsSync(pdf.path)) pdfFiles.push(pdf.path);
     }
-    while (opts.length < 4) opts.push(`Option ${opts.length + 1}`);
-    // Shuffle
-    for (let i = opts.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [opts[i], opts[j]] = [opts[j], opts[i]];
-    }
-    return { options: opts, correctIndex: opts.indexOf(correct) };
-  };
+  }
+  if (paper.pdfFilePath && fs.existsSync(paper.pdfFilePath)) {
+    pdfFiles.push(paper.pdfFilePath);
+  }
 
-  // Pattern 1: Definition/fill-in-the-blank from sentences
-  for (let i = 0; i < sentences.length && questions.length < 8; i++) {
-    const s = sentences[i];
-    if (s.includes('is') || s.includes('are') || s.includes('was') || s.includes('were')) {
-      const parts = s.split(/\s+is\s+|\s+are\s+/);
-      if (parts.length === 2) {
-        const term = parts[0].trim().replace(/^(the|a|an|in|of|for)\s+/i, '');
-        const definition = parts[1].trim();
-        if (term.length > 3 && definition.length > 10 && !used.has(term)) {
-          used.add(term);
-          const { options, correctIndex } = makeDistractors(term, keywords);
-          questions.push({
-            question: `Which term best matches this definition: "${definition.substring(0, 120)}${definition.length > 120 ? '...' : ''}"?`,
-            options: options.map(o => o.substring(0, 60)),
-            correctAnswer: correctIndex,
-            marks: 1,
-            difficulty: 'medium',
-            topic: subject || 'General'
-          });
-        }
+  if (pdfFiles.length === 0) {
+    return { success: false, error: 'No PDF files found for this paper' };
+  }
+
+  for (const pdfPath of pdfFiles) {
+    try {
+      const pdfBuffer = fs.readFileSync(pdfPath);
+      const pdfData = await pdfParse(pdfBuffer);
+      if (pdfData.text && pdfData.text.trim()) {
+        texts.push(pdfData.text.trim());
       }
+    } catch (err) {
+      console.error('PDF parse error for', pdfPath, ':', err.message);
     }
   }
 
-  // Pattern 2: True/false converted to MCQ from statements
-  for (let i = 0; i < paragraphs.length && questions.length < 12; i++) {
-    const p = paragraphs[i].replace(/\s+/g, ' ').trim();
-    if (p.length > 80 && p.length < 200 && !used.has(p.substring(0, 40))) {
-      used.add(p.substring(0, 40));
-      const firstSentence = p.split('.')[0].trim();
-      if (firstSentence.length > 30) {
-        const negated = 'Not ' + firstSentence.toLowerCase();
-        const opts = [firstSentence, negated, 'Partially ' + firstSentence.toLowerCase(), 'None of the above'];
-        questions.push({
-          question: `Which statement is correct regarding ${subject || 'this topic'}?`,
-          options: opts.map(o => o.substring(0, 70)),
-          correctAnswer: 0,
-          marks: 1,
-          difficulty: 'easy',
-          topic: subject || 'General'
-        });
-      }
-    }
+  if (texts.length === 0) {
+    return { success: false, error: 'Could not extract text from any PDF. The PDFs may be scanned/image-based.' };
   }
 
-  // Pattern 3: Keyword identification questions
-  const importantWords = keywords.slice(0, 6).filter(k => k.length > 3);
-  for (let i = 0; i < importantWords.length && questions.length < 15; i++) {
-    const word = importantWords[i];
-    if (used.has(word)) continue;
-    used.add(word);
-    const { options, correctIndex } = makeDistractors(word, keywords);
-    questions.push({
-      question: `In the context of ${subject || 'this subject'}, which of the following is most relevant?`,
-      options: options.map(o => o.substring(0, 60)),
-      correctAnswer: correctIndex,
-      marks: 1,
-      difficulty: 'medium',
-      topic: subject || 'General'
-    });
-  }
-
-  // If still too few, add generic comprehension questions
-  while (questions.length < 5) {
-    const idx = questions.length;
-    questions.push({
-      question: `Question ${idx + 1}: Based on the content of the paper "${title || 'this exam'}" on ${subject || 'this subject'}, select the most accurate statement.`,
-      options: [
-        'The paper covers fundamental concepts thoroughly.',
-        'The paper focuses only on advanced topics.',
-        'The paper is unrelated to the syllabus.',
-        'None of the above'
-      ],
-      correctAnswer: 0,
-      marks: 1,
-      difficulty: 'easy',
-      topic: subject || 'General'
-    });
-  }
-
-  return questions;
+  return { success: true, text: texts.join('\n\n---\n\n') };
 }
 
-function extractKeywords(text) {
-  const stopWords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'between', 'under', 'and', 'but', 'or', 'yet', 'so', 'if', 'because', 'although', 'though', 'while', 'where', 'when', 'that', 'which', 'who', 'whom', 'whose', 'what', 'this', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his', 'its', 'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs']);
-  const words = text.toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(w => w.length > 3 && !stopWords.has(w));
-  const freq = {};
-  words.forEach(w => { freq[w] = (freq[w] || 0) + 1; });
-  return Object.entries(freq).sort((a, b) => b[1] - a[1]).map(([word]) => word).slice(0, 30);
-}
-
-async function generateQuestionsFromPDF(paperId, pdfPath, title, subject) {
+// Generate questions from ALL PDFs of a paper using AI
+async function generateQuestionsFromPaper(paper) {
   try {
-    if (!fs.existsSync(pdfPath)) {
-      console.error('PDF file not found:', pdfPath);
-      return { success: false, error: 'PDF file not found' };
+    if (!aiEnabled) {
+      return { success: false, error: 'AI API not configured. Please set AI_API_KEY and AI_API_BASE environment variables.' };
     }
 
-    const pdfBuffer = fs.readFileSync(pdfPath);
-    const pdfData = await pdfParse(pdfBuffer);
-    let text = pdfData.text || '';
-
-    if (!text.trim()) {
-      return { success: false, error: 'Could not extract text from PDF. The PDF may be scanned/image-based.' };
+    const extractResult = await extractTextFromAllPDFs(paper);
+    if (!extractResult.success) {
+      return extractResult;
     }
 
-    let questions = [];
-    let usedAI = false;
+    let combinedText = extractResult.text;
 
-    // Try AI first if configured
-    if (aiEnabled) {
-      // Truncate if too long (approx 8000 chars to stay within token limits)
-      const MAX_CHARS = 8000;
-      let aiText = text;
-      if (aiText.length > MAX_CHARS) {
-        aiText = aiText.substring(0, MAX_CHARS) + '\n\n[Content truncated due to length...]';
-      }
+    // Truncate if too long (approx 12000 chars for Groq's larger context)
+    const MAX_CHARS = 12000;
+    if (combinedText.length > MAX_CHARS) {
+      combinedText = combinedText.substring(0, MAX_CHARS) + '\n\n[Additional content truncated...]';
+    }
 
-      const prompt = `You are an expert exam question generator. I will give you the text content of a previous year exam paper (PYQ). Your task is to generate multiple-choice questions based on this paper.
+    const prompt = `You are an expert exam question generator. I have provided you with the text content of one or more previous year exam papers (PYQs). Your task is to generate a complete set of multiple-choice questions for a new mock test based on these papers.
 
-EXAM DETAILS:
-Title: ${title}
-Subject: ${subject}
+PAPER / EXAM DETAILS:
+- Paper Name: ${paper.title}
+- Subject: ${paper.subject}
+- Department: ${paper.department || 'N/A'}
+- Semester: ${paper.semester || 'N/A'}
+- Total Marks Required: ${paper.totalMarks || 'Auto-calculate'}
+- Duration: ${paper.duration || 60} minutes
+- Target Question Count: approximately ${paper.totalMarks || 30} marks worth of questions (typically 1 mark per question, some 2-mark questions for complex topics)
 
 INSTRUCTIONS:
-1. Read through the entire paper content carefully.
-2. Generate multiple-choice questions. Aim for 10-25 questions depending on the paper length and content richness.
-3. For each question:
-   - Include some EXACT same questions from the paper if they are suitable as multiple-choice questions
-   - Also create NEW similar questions that test the same concepts and topics
+1. Read through ALL the provided PYQ content carefully.
+2. Generate a complete set of multiple-choice questions that would be suitable for a ${paper.totalMarks || 'full'} mark exam on "${paper.title}" lasting ${paper.duration || 60} minutes.
+3. The total marks of ALL generated questions should equal or closely match the required Total Marks (${paper.totalMarks || 'auto'}).
+4. For each question:
+   - Include some EXACT same questions from the PYQs if they are suitable as multiple-choice questions
+   - Also create NEW similar questions that test the same concepts and topics (vary the wording, numbers, or scenarios)
    - Each question must have exactly 4 options (A, B, C, D)
    - Mark the correct answer with a 0-based index (0=A, 1=B, 2=C, 3=D)
-   - Assign marks: typically 1 mark per question, 2 marks for more complex questions
+   - Assign marks per question: typically 1 mark per question, 2 marks for more complex/computational questions
    - Include difficulty level: easy, medium, or hard
-   - Include a topic tag for the question
-4. Ensure questions cover ALL major topics in the paper
-5. Return ONLY a valid JSON array with NO markdown formatting, NO code blocks, NO explanation text outside the JSON
+   - Include a topic tag for each question
+5. Ensure questions cover ALL major topics from the PYQs evenly
+6. Vary question types: conceptual, definitional, application-based, numerical where applicable
+7. Return ONLY a valid JSON array with NO markdown formatting, NO code blocks, NO explanation text outside the JSON
 
-PAPER CONTENT:
-${aiText}
+PREVIOUS YEAR EXAM PAPER CONTENT:
+${combinedText}
 
-JSON FORMAT (return ONLY this, no other text):
+JSON FORMAT (return ONLY this array, no other text):
 [
   {
     "question": "Question text here",
@@ -676,119 +605,199 @@ JSON FORMAT (return ONLY this, no other text):
   }
 ]`;
 
-      const aiResponse = await callAI(prompt);
-      if (aiResponse) {
-        // Clean up response - extract JSON from possible markdown code blocks
-        let cleanedResponse = aiResponse.trim();
-        if (cleanedResponse.startsWith('```json')) {
-          cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-        } else if (cleanedResponse.startsWith('```')) {
-          cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
-        }
-        cleanedResponse = cleanedResponse.trim();
-
-        try {
-          const aiQuestions = JSON.parse(cleanedResponse);
-          if (Array.isArray(aiQuestions) && aiQuestions.length > 0) {
-            for (const q of aiQuestions) {
-              if (!q.question || !Array.isArray(q.options) || q.options.length !== 4) continue;
-              if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
-              questions.push({
-                paperId: new mongoose.Types.ObjectId(paperId),
-                question: q.question.trim(),
-                options: q.options.map(o => String(o).trim()),
-                correctAnswer: Math.round(q.correctAnswer),
-                marks: Number(q.marks) || 1,
-                difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
-                topic: q.topic || ''
-              });
-            }
-            if (questions.length > 0) usedAI = true;
-          }
-        } catch (parseErr) {
-          console.error('AI JSON parse error, falling back to free generator:', parseErr.message);
-        }
-      }
+    const aiResponse = await callAI(prompt);
+    if (!aiResponse) {
+      return { success: false, error: 'AI generation failed. Please check your AI API configuration (AI_API_KEY, AI_API_BASE).' };
     }
 
-    // Fall back to free text-based generator if AI failed or not configured
-    if (questions.length === 0) {
-      console.log('AI unavailable or failed. Using free fallback question generator for paper', paperId);
-      const fallbackQuestions = fallbackGenerateQuestions(text, title, subject);
-      for (const q of fallbackQuestions) {
-        questions.push({
-          paperId: new mongoose.Types.ObjectId(paperId),
-          question: q.question.trim(),
-          options: q.options.map(o => String(o).trim()),
-          correctAnswer: Math.round(q.correctAnswer),
-          marks: Number(q.marks) || 1,
-          difficulty: q.difficulty || 'medium',
-          topic: q.topic || ''
-        });
-      }
+    // Clean up response - extract JSON from possible markdown code blocks
+    let cleanedResponse = aiResponse.trim();
+    if (cleanedResponse.startsWith('```json')) {
+      cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+    } else if (cleanedResponse.startsWith('```')) {
+      cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
+    }
+    cleanedResponse = cleanedResponse.trim();
+
+    let rawQuestions;
+    try {
+      rawQuestions = JSON.parse(cleanedResponse);
+    } catch (parseErr) {
+      console.error('AI JSON parse error:', parseErr.message);
+      console.error('Raw response (first 500 chars):', cleanedResponse.substring(0, 500));
+      return { success: false, error: 'AI returned invalid JSON format. The AI response could not be parsed into questions.' };
+    }
+
+    if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+      return { success: false, error: 'AI generated no valid questions.' };
+    }
+
+    // Validate and normalize each question
+    const questions = [];
+    for (const q of rawQuestions) {
+      if (!q.question || !Array.isArray(q.options) || q.options.length !== 4) continue;
+      if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+      questions.push({
+        paperId: new mongoose.Types.ObjectId(paper._id),
+        question: q.question.trim(),
+        options: q.options.map(o => String(o).trim()),
+        correctAnswer: Math.round(q.correctAnswer),
+        marks: Number(q.marks) || 1,
+        difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
+        topic: q.topic || ''
+      });
     }
 
     if (questions.length === 0) {
-      return { success: false, error: 'Could not generate any questions from this PDF. The PDF may have no readable text content.' };
+      return { success: false, error: 'No valid questions after validation. The AI response did not contain properly formatted questions.' };
     }
 
     // Delete existing questions for this paper before saving new ones
-    await MockQuestion.deleteMany({ paperId: new mongoose.Types.ObjectId(paperId) });
+    await MockQuestion.deleteMany({ paperId: new mongoose.Types.ObjectId(paper._id) });
     await MockQuestion.insertMany(questions);
 
-    // Update paper totals
-    const count = await MockQuestion.countDocuments({ paperId: new mongoose.Types.ObjectId(paperId) });
+    // Recalculate totals from actual saved questions
+    const count = await MockQuestion.countDocuments({ paperId: new mongoose.Types.ObjectId(paper._id) });
     const totalMarksResult = await MockQuestion.aggregate([
-      { $match: { paperId: new mongoose.Types.ObjectId(paperId) } },
+      { $match: { paperId: new mongoose.Types.ObjectId(paper._id) } },
       { $group: { _id: null, total: { $sum: '$marks' } } }
     ]);
+    const actualTotalMarks = totalMarksResult.length > 0 ? totalMarksResult[0].total : 0;
 
-    await MockTestPaper.findByIdAndUpdate(paperId, {
+    await MockTestPaper.findByIdAndUpdate(paper._id, {
       totalQuestions: count,
-      totalMarks: totalMarksResult.length > 0 ? totalMarksResult[0].total : 0
+      totalMarks: actualTotalMarks
     });
 
     return {
       success: true,
       count: questions.length,
-      totalMarks: totalMarksResult.length > 0 ? totalMarksResult[0].total : 0,
-      usedAI: usedAI
+      totalMarks: actualTotalMarks,
+      usedAI: true
     };
   } catch (err) {
-    console.error('generateQuestionsFromPDF error:', err);
+    console.error('generateQuestionsFromPaper error:', err);
     return { success: false, error: err.message };
   }
 }
 
 // ========== MOCK TEST API ROUTES ==========
 
-// Admin: Upload PDF and create paper (auto-generates questions via AI)
+// Admin: Upload PDF and create paper (legacy - kept for backward compatibility)
 app.post('/api/admin/mock-tests/upload', authMiddleware, adminMiddleware, upload.single('pdf'), async (req, res) => {
   try {
-    const { title, subject, department, semester, year, duration } = req.body;
+    const { title, subject, department, semester, year, totalMarks, duration } = req.body;
     const paper = new MockTestPaper({
       title, subject, department, semester, year,
+      totalMarks: Number(totalMarks) || 0,
       duration: Number(duration) || 60,
       pdfFilePath: req.file ? req.file.path : '',
       pdfUrl: req.file ? `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}` : ''
     });
+    if (req.file) {
+      paper.pdfFiles = [{
+        filename: req.file.filename,
+        originalName: req.file.originalname,
+        path: req.file.path,
+        url: `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`,
+        uploadedAt: new Date()
+      }];
+    }
     await paper.save();
 
-    // Trigger question generation in the background (uses AI if configured, else free fallback)
-    if (req.file) {
-      generateQuestionsFromPDF(paper._id, req.file.path, title, subject)
-        .then(result => {
-          if (result.success) {
-            console.log(`Generated ${result.count} questions for paper ${paper._id} (AI: ${result.usedAI})`);
-          } else {
-            console.error(`Generation failed for paper ${paper._id}:`, result.error);
-          }
-        })
-        .catch(err => console.error('Generation error:', err));
+    res.status(201).json({
+      message: 'Paper created. Upload more PYQ PDFs to this paper, then click Generate Questions.',
+      paper
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to upload paper' });
+  }
+});
+
+// Admin: Create a new paper (without PDF)
+app.post('/api/admin/mock-tests/papers', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { title, subject, department, semester, year, totalMarks, duration } = req.body;
+    const paper = new MockTestPaper({
+      title,
+      subject,
+      department,
+      semester,
+      year,
+      totalMarks: Number(totalMarks) || 0,
+      duration: Number(duration) || 60
+    });
+    await paper.save();
+    res.status(201).json({ message: 'Paper created successfully. Now upload PYQ PDFs to it.', paper });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create paper' });
+  }
+});
+
+// Admin: Upload PDFs to an existing paper
+app.post('/api/admin/mock-tests/:id/pdfs', authMiddleware, adminMiddleware, upload.array('pdfs', 10), async (req, res) => {
+  try {
+    const paper = await MockTestPaper.findById(req.params.id);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No PDF files uploaded' });
     }
 
+    const newFiles = req.files.map(file => ({
+      filename: file.filename,
+      originalName: file.originalname,
+      path: file.path,
+      url: `${req.protocol}://${req.get('host')}/uploads/${file.filename}`,
+      uploadedAt: new Date()
+    }));
+
+    paper.pdfFiles = paper.pdfFiles || [];
+    paper.pdfFiles.push(...newFiles);
+
+    if (newFiles.length > 0) {
+      paper.pdfFilePath = newFiles[0].path;
+      paper.pdfUrl = newFiles[0].url;
+    }
+
+    await paper.save();
+    res.json({
+      message: `${req.files.length} PDF(s) uploaded successfully.`,
+      paper,
+      pdfCount: paper.pdfFiles.length
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to upload PDFs' });
+  }
+});
+
+// Admin: Upload PDF and create paper (legacy - kept for backward compatibility)
+app.post('/api/admin/mock-tests/upload', authMiddleware, adminMiddleware, upload.single('pdf'), async (req, res) => {
+  try {
+    const { title, subject, department, semester, year, totalMarks, duration } = req.body;
+    const paper = new MockTestPaper({
+      title, subject, department, semester, year,
+      totalMarks: Number(totalMarks) || 0,
+      duration: Number(duration) || 60,
+      pdfFilePath: req.file ? req.file.path : '',
+      pdfUrl: req.file ? `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}` : ''
+    });
+    if (req.file) {
+      paper.pdfFiles = [{
+        filename: req.file.filename,
+        originalName: req.file.originalname,
+        path: req.file.path,
+        url: `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`,
+        uploadedAt: new Date()
+      }];
+    }
+    await paper.save();
+
     res.status(201).json({
-      message: 'Paper uploaded. Questions are being generated automatically from the PDF content. Refresh in a moment to see them.',
+      message: 'Paper created. Upload more PYQ PDFs to this paper, then click Generate Questions.',
       paper
     });
   } catch (err) {
@@ -842,10 +851,9 @@ app.get('/api/admin/ai-status', authMiddleware, adminMiddleware, (req, res) => {
     aiEnabled,
     apiBase: AI_API_BASE,
     model: AI_MODEL,
-    hasFallback: true,
     message: aiEnabled
-      ? 'AI API is configured. Questions will be generated using AI for best quality, with free fallback if AI fails.'
-      : 'AI API key not configured. Questions will be generated using the free built-in text analyzer (no API key needed). For better quality, set AI_API_KEY with a free Groq or Gemini API key.'
+      ? 'AI API is configured. Ready to generate questions from uploaded PDFs.'
+      : 'AI API key not configured. Please set AI_API_KEY and AI_API_BASE (e.g., https://api.groq.com/openai/v1) in environment variables to enable question generation.'
   });
 });
 app.get('/api/admin/mock-tests', authMiddleware, adminMiddleware, async (req, res) => {
@@ -864,6 +872,19 @@ app.delete('/api/admin/mock-tests/:id', authMiddleware, adminMiddleware, async (
     await MockTestResult.deleteMany({ paperId: req.params.id });
     const paper = await MockTestPaper.findByIdAndDelete(req.params.id);
     if (!paper) return res.status(404).json({ error: 'Paper not found' });
+
+    // Delete all associated PDF files
+    if (paper.pdfFiles && paper.pdfFiles.length > 0) {
+      for (const pdf of paper.pdfFiles) {
+        if (pdf.path && fs.existsSync(pdf.path)) {
+          try { fs.unlinkSync(pdf.path); } catch (e) { /* ignore */ }
+        }
+      }
+    }
+    if (paper.pdfFilePath && fs.existsSync(paper.pdfFilePath)) {
+      try { fs.unlinkSync(paper.pdfFilePath); } catch (e) { /* ignore */ }
+    }
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -880,19 +901,20 @@ app.get('/api/admin/mock-tests/:id/questions', authMiddleware, adminMiddleware, 
   }
 });
 
-// Admin: Regenerate questions with AI or fallback
+// Admin: Generate questions from all PDFs for a paper
 app.post('/api/admin/mock-tests/:id/generate', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const paper = await MockTestPaper.findById(req.params.id);
     if (!paper) return res.status(404).json({ error: 'Paper not found' });
-    if (!paper.pdfFilePath || !fs.existsSync(paper.pdfFilePath)) {
-      return res.status(400).json({ error: 'PDF file not available for this paper' });
-    }
 
-    const result = await generateQuestionsFromPDF(paper._id, paper.pdfFilePath, paper.title, paper.subject);
+    const result = await generateQuestionsFromPaper(paper);
     if (result.success) {
-      const source = result.usedAI ? 'AI' : 'Free Text Analyzer';
-      res.json({ success: true, message: `${source} generated ${result.count} questions. Total marks: ${result.totalMarks}`, count: result.count, totalMarks: result.totalMarks, usedAI: result.usedAI });
+      res.json({
+        success: true,
+        message: `AI generated ${result.count} questions from ${paper.pdfFiles?.length || 1} PDF(s). Total marks: ${result.totalMarks}`,
+        count: result.count,
+        totalMarks: result.totalMarks
+      });
     } else {
       res.status(500).json({ error: result.error || 'Question generation failed' });
     }
