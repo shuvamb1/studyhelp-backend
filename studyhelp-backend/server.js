@@ -51,9 +51,11 @@ for (const key of requiredEnv) {
 }
 
 // AI Configuration (OpenAI-compatible API)
+// Groq free models: llama-3.3-70b-versatile, llama-3.1-8b-instant, gemma-2-9b-it
+// OpenAI models: gpt-4o-mini, gpt-4o
 const AI_API_KEY = process.env.AI_API_KEY || '';
 const AI_API_BASE = process.env.AI_API_BASE || 'https://api.openai.com/v1';
-const AI_MODEL = process.env.AI_MODEL || 'gpt-4o-mini';
+const AI_MODEL = process.env.AI_MODEL || 'llama-3.3-70b-versatile';
 const aiEnabled = !!AI_API_KEY;
 
 mongoose.connect(process.env.MONGODB_URI)
@@ -474,7 +476,7 @@ const MockTestResult = mongoose.model('MockTestResult', mockTestResultSchema);
 // Ephemeral test session (stores AI-generated questions per test attempt, auto-expires)
 const testSessionSchema = new mongoose.Schema({
   paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper' },
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'Student' },
+  userId: String, // can be MongoDB ObjectId (regular users) or 'admin_id' (admin)
   questions: [{
     question: String,
     options: [String],
