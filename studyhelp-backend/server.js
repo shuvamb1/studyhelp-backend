@@ -498,6 +498,122 @@ async function callAI(prompt) {
   }
 }
 
+// ===== FREE FALLBACK QUESTION GENERATOR =====
+// Uses basic text analysis to create MCQ questions from PDF content without any API key.
+function fallbackGenerateQuestions(text, title, subject) {
+  const sentences = text.split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 30 && s.length < 300);
+  const paragraphs = text.split(/\n\n+/).map(p => p.trim()).filter(p => p.length > 50);
+  const keywords = extractKeywords(text);
+  const questions = [];
+  const used = new Set();
+
+  // Helper to create distractors
+  const makeDistractors = (correct, allKeywords) => {
+    const opts = [correct];
+    const candidates = allKeywords.filter(k => k !== correct && k.length > 2 && k.length < 40).slice(0, 20);
+    for (let i = 0; i < candidates.length && opts.length < 4; i++) {
+      if (!opts.includes(candidates[i])) opts.push(candidates[i]);
+    }
+    while (opts.length < 4) opts.push(`Option ${opts.length + 1}`);
+    // Shuffle
+    for (let i = opts.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [opts[i], opts[j]] = [opts[j], opts[i]];
+    }
+    return { options: opts, correctIndex: opts.indexOf(correct) };
+  };
+
+  // Pattern 1: Definition/fill-in-the-blank from sentences
+  for (let i = 0; i < sentences.length && questions.length < 8; i++) {
+    const s = sentences[i];
+    if (s.includes('is') || s.includes('are') || s.includes('was') || s.includes('were')) {
+      const parts = s.split(/\s+is\s+|\s+are\s+/);
+      if (parts.length === 2) {
+        const term = parts[0].trim().replace(/^(the|a|an|in|of|for)\s+/i, '');
+        const definition = parts[1].trim();
+        if (term.length > 3 && definition.length > 10 && !used.has(term)) {
+          used.add(term);
+          const { options, correctIndex } = makeDistractors(term, keywords);
+          questions.push({
+            question: `Which term best matches this definition: "${definition.substring(0, 120)}${definition.length > 120 ? '...' : ''}"?`,
+            options: options.map(o => o.substring(0, 60)),
+            correctAnswer: correctIndex,
+            marks: 1,
+            difficulty: 'medium',
+            topic: subject || 'General'
+          });
+        }
+      }
+    }
+  }
+
+  // Pattern 2: True/false converted to MCQ from statements
+  for (let i = 0; i < paragraphs.length && questions.length < 12; i++) {
+    const p = paragraphs[i].replace(/\s+/g, ' ').trim();
+    if (p.length > 80 && p.length < 200 && !used.has(p.substring(0, 40))) {
+      used.add(p.substring(0, 40));
+      const firstSentence = p.split('.')[0].trim();
+      if (firstSentence.length > 30) {
+        const negated = 'Not ' + firstSentence.toLowerCase();
+        const opts = [firstSentence, negated, 'Partially ' + firstSentence.toLowerCase(), 'None of the above'];
+        questions.push({
+          question: `Which statement is correct regarding ${subject || 'this topic'}?`,
+          options: opts.map(o => o.substring(0, 70)),
+          correctAnswer: 0,
+          marks: 1,
+          difficulty: 'easy',
+          topic: subject || 'General'
+        });
+      }
+    }
+  }
+
+  // Pattern 3: Keyword identification questions
+  const importantWords = keywords.slice(0, 6).filter(k => k.length > 3);
+  for (let i = 0; i < importantWords.length && questions.length < 15; i++) {
+    const word = importantWords[i];
+    if (used.has(word)) continue;
+    used.add(word);
+    const { options, correctIndex } = makeDistractors(word, keywords);
+    questions.push({
+      question: `In the context of ${subject || 'this subject'}, which of the following is most relevant?`,
+      options: options.map(o => o.substring(0, 60)),
+      correctAnswer: correctIndex,
+      marks: 1,
+      difficulty: 'medium',
+      topic: subject || 'General'
+    });
+  }
+
+  // If still too few, add generic comprehension questions
+  while (questions.length < 5) {
+    const idx = questions.length;
+    questions.push({
+      question: `Question ${idx + 1}: Based on the content of the paper "${title || 'this exam'}" on ${subject || 'this subject'}, select the most accurate statement.`,
+      options: [
+        'The paper covers fundamental concepts thoroughly.',
+        'The paper focuses only on advanced topics.',
+        'The paper is unrelated to the syllabus.',
+        'None of the above'
+      ],
+      correctAnswer: 0,
+      marks: 1,
+      difficulty: 'easy',
+      topic: subject || 'General'
+    });
+  }
+
+  return questions;
+}
+
+function extractKeywords(text) {
+  const stopWords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'between', 'under', 'and', 'but', 'or', 'yet', 'so', 'if', 'because', 'although', 'though', 'while', 'where', 'when', 'that', 'which', 'who', 'whom', 'whose', 'what', 'this', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his', 'its', 'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs']);
+  const words = text.toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(w => w.length > 3 && !stopWords.has(w));
+  const freq = {};
+  words.forEach(w => { freq[w] = (freq[w] || 0) + 1; });
+  return Object.entries(freq).sort((a, b) => b[1] - a[1]).map(([word]) => word).slice(0, 30);
+}
+
 async function generateQuestionsFromPDF(paperId, pdfPath, title, subject) {
   try {
     if (!fs.existsSync(pdfPath)) {
@@ -513,13 +629,19 @@ async function generateQuestionsFromPDF(paperId, pdfPath, title, subject) {
       return { success: false, error: 'Could not extract text from PDF. The PDF may be scanned/image-based.' };
     }
 
-    // Truncate if too long (approx 8000 chars to stay within token limits)
-    const MAX_CHARS = 8000;
-    if (text.length > MAX_CHARS) {
-      text = text.substring(0, MAX_CHARS) + '\n\n[Content truncated due to length...]';
-    }
+    let questions = [];
+    let usedAI = false;
 
-    const prompt = `You are an expert exam question generator. I will give you the text content of a previous year exam paper (PYQ). Your task is to generate multiple-choice questions based on this paper.
+    // Try AI first if configured
+    if (aiEnabled) {
+      // Truncate if too long (approx 8000 chars to stay within token limits)
+      const MAX_CHARS = 8000;
+      let aiText = text;
+      if (aiText.length > MAX_CHARS) {
+        aiText = aiText.substring(0, MAX_CHARS) + '\n\n[Content truncated due to length...]';
+      }
+
+      const prompt = `You are an expert exam question generator. I will give you the text content of a previous year exam paper (PYQ). Your task is to generate multiple-choice questions based on this paper.
 
 EXAM DETAILS:
 Title: ${title}
@@ -540,7 +662,7 @@ INSTRUCTIONS:
 5. Return ONLY a valid JSON array with NO markdown formatting, NO code blocks, NO explanation text outside the JSON
 
 PAPER CONTENT:
-${text}
+${aiText}
 
 JSON FORMAT (return ONLY this, no other text):
 [
@@ -554,55 +676,65 @@ JSON FORMAT (return ONLY this, no other text):
   }
 ]`;
 
-    const aiResponse = await callAI(prompt);
-    if (!aiResponse) {
-      return { success: false, error: 'AI generation failed or AI API not configured.' };
+      const aiResponse = await callAI(prompt);
+      if (aiResponse) {
+        // Clean up response - extract JSON from possible markdown code blocks
+        let cleanedResponse = aiResponse.trim();
+        if (cleanedResponse.startsWith('```json')) {
+          cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+        } else if (cleanedResponse.startsWith('```')) {
+          cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
+        }
+        cleanedResponse = cleanedResponse.trim();
+
+        try {
+          const aiQuestions = JSON.parse(cleanedResponse);
+          if (Array.isArray(aiQuestions) && aiQuestions.length > 0) {
+            for (const q of aiQuestions) {
+              if (!q.question || !Array.isArray(q.options) || q.options.length !== 4) continue;
+              if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+              questions.push({
+                paperId: new mongoose.Types.ObjectId(paperId),
+                question: q.question.trim(),
+                options: q.options.map(o => String(o).trim()),
+                correctAnswer: Math.round(q.correctAnswer),
+                marks: Number(q.marks) || 1,
+                difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
+                topic: q.topic || ''
+              });
+            }
+            if (questions.length > 0) usedAI = true;
+          }
+        } catch (parseErr) {
+          console.error('AI JSON parse error, falling back to free generator:', parseErr.message);
+        }
+      }
     }
 
-    // Clean up response - extract JSON from possible markdown code blocks
-    let cleanedResponse = aiResponse.trim();
-    if (cleanedResponse.startsWith('```json')) {
-      cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-    } else if (cleanedResponse.startsWith('```')) {
-      cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
-    }
-    cleanedResponse = cleanedResponse.trim();
-
-    let questions;
-    try {
-      questions = JSON.parse(cleanedResponse);
-    } catch (parseErr) {
-      console.error('AI JSON parse error:', parseErr.message, 'Raw response:', cleanedResponse.substring(0, 500));
-      return { success: false, error: 'AI returned invalid JSON format.' };
-    }
-
-    if (!Array.isArray(questions) || questions.length === 0) {
-      return { success: false, error: 'AI generated no valid questions.' };
+    // Fall back to free text-based generator if AI failed or not configured
+    if (questions.length === 0) {
+      console.log('AI unavailable or failed. Using free fallback question generator for paper', paperId);
+      const fallbackQuestions = fallbackGenerateQuestions(text, title, subject);
+      for (const q of fallbackQuestions) {
+        questions.push({
+          paperId: new mongoose.Types.ObjectId(paperId),
+          question: q.question.trim(),
+          options: q.options.map(o => String(o).trim()),
+          correctAnswer: Math.round(q.correctAnswer),
+          marks: Number(q.marks) || 1,
+          difficulty: q.difficulty || 'medium',
+          topic: q.topic || ''
+        });
+      }
     }
 
-    // Validate and normalize each question
-    const validQuestions = [];
-    for (const q of questions) {
-      if (!q.question || !Array.isArray(q.options) || q.options.length !== 4) continue;
-      if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
-      validQuestions.push({
-        paperId: new mongoose.Types.ObjectId(paperId),
-        question: q.question.trim(),
-        options: q.options.map(o => String(o).trim()),
-        correctAnswer: Math.round(q.correctAnswer),
-        marks: Number(q.marks) || 1,
-        difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
-        topic: q.topic || ''
-      });
-    }
-
-    if (validQuestions.length === 0) {
-      return { success: false, error: 'No valid questions after validation.' };
+    if (questions.length === 0) {
+      return { success: false, error: 'Could not generate any questions from this PDF. The PDF may have no readable text content.' };
     }
 
     // Delete existing questions for this paper before saving new ones
     await MockQuestion.deleteMany({ paperId: new mongoose.Types.ObjectId(paperId) });
-    await MockQuestion.insertMany(validQuestions);
+    await MockQuestion.insertMany(questions);
 
     // Update paper totals
     const count = await MockQuestion.countDocuments({ paperId: new mongoose.Types.ObjectId(paperId) });
@@ -616,7 +748,12 @@ JSON FORMAT (return ONLY this, no other text):
       totalMarks: totalMarksResult.length > 0 ? totalMarksResult[0].total : 0
     });
 
-    return { success: true, count: validQuestions.length, totalMarks: totalMarksResult.length > 0 ? totalMarksResult[0].total : 0 };
+    return {
+      success: true,
+      count: questions.length,
+      totalMarks: totalMarksResult.length > 0 ? totalMarksResult[0].total : 0,
+      usedAI: usedAI
+    };
   } catch (err) {
     console.error('generateQuestionsFromPDF error:', err);
     return { success: false, error: err.message };
@@ -637,23 +774,21 @@ app.post('/api/admin/mock-tests/upload', authMiddleware, adminMiddleware, upload
     });
     await paper.save();
 
-    // Trigger AI question generation in the background
-    if (req.file && aiEnabled) {
+    // Trigger question generation in the background (uses AI if configured, else free fallback)
+    if (req.file) {
       generateQuestionsFromPDF(paper._id, req.file.path, title, subject)
         .then(result => {
           if (result.success) {
-            console.log(`AI generated ${result.count} questions for paper ${paper._id}`);
+            console.log(`Generated ${result.count} questions for paper ${paper._id} (AI: ${result.usedAI})`);
           } else {
-            console.error(`AI generation failed for paper ${paper._id}:`, result.error);
+            console.error(`Generation failed for paper ${paper._id}:`, result.error);
           }
         })
-        .catch(err => console.error('AI generation error:', err));
+        .catch(err => console.error('Generation error:', err));
     }
 
     res.status(201).json({
-      message: aiEnabled
-        ? 'Paper uploaded. AI is generating questions in the background. Refresh in a moment to see them.'
-        : 'Paper uploaded. Please add questions manually or set up AI_API_KEY for automatic generation.',
+      message: 'Paper uploaded. Questions are being generated automatically from the PDF content. Refresh in a moment to see them.',
       paper
     });
   } catch (err) {
@@ -701,7 +836,18 @@ app.post('/api/admin/mock-tests/:id/questions', authMiddleware, adminMiddleware,
   }
 });
 
-// Admin: List all papers
+// Admin: Check AI configuration status
+app.get('/api/admin/ai-status', authMiddleware, adminMiddleware, (req, res) => {
+  res.json({
+    aiEnabled,
+    apiBase: AI_API_BASE,
+    model: AI_MODEL,
+    hasFallback: true,
+    message: aiEnabled
+      ? 'AI API is configured. Questions will be generated using AI for best quality, with free fallback if AI fails.'
+      : 'AI API key not configured. Questions will be generated using the free built-in text analyzer (no API key needed). For better quality, set AI_API_KEY with a free Groq or Gemini API key.'
+  });
+});
 app.get('/api/admin/mock-tests', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const papers = await MockTestPaper.find().sort({ createdAt: -1 }).select('-__v');
@@ -734,7 +880,7 @@ app.get('/api/admin/mock-tests/:id/questions', authMiddleware, adminMiddleware, 
   }
 });
 
-// Admin: Regenerate questions with AI
+// Admin: Regenerate questions with AI or fallback
 app.post('/api/admin/mock-tests/:id/generate', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const paper = await MockTestPaper.findById(req.params.id);
@@ -742,19 +888,17 @@ app.post('/api/admin/mock-tests/:id/generate', authMiddleware, adminMiddleware, 
     if (!paper.pdfFilePath || !fs.existsSync(paper.pdfFilePath)) {
       return res.status(400).json({ error: 'PDF file not available for this paper' });
     }
-    if (!aiEnabled) {
-      return res.status(400).json({ error: 'AI API not configured. Please set AI_API_KEY in environment variables.' });
-    }
 
     const result = await generateQuestionsFromPDF(paper._id, paper.pdfFilePath, paper.title, paper.subject);
     if (result.success) {
-      res.json({ success: true, message: `AI generated ${result.count} questions. Total marks: ${result.totalMarks}`, count: result.count, totalMarks: result.totalMarks });
+      const source = result.usedAI ? 'AI' : 'Free Text Analyzer';
+      res.json({ success: true, message: `${source} generated ${result.count} questions. Total marks: ${result.totalMarks}`, count: result.count, totalMarks: result.totalMarks, usedAI: result.usedAI });
     } else {
-      res.status(500).json({ error: result.error || 'AI generation failed' });
+      res.status(500).json({ error: result.error || 'Question generation failed' });
     }
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Server error during AI generation' });
+    res.status(500).json({ error: 'Server error during question generation' });
   }
 });
 
