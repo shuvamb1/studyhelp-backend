@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const pdfParse = require('pdf-parse');
 
 const app = express();
 
@@ -48,6 +49,12 @@ for (const key of requiredEnv) {
     process.exit(1);
   }
 }
+
+// AI Configuration (OpenAI-compatible API)
+const AI_API_KEY = process.env.AI_API_KEY || '';
+const AI_API_BASE = process.env.AI_API_BASE || 'https://api.openai.com/v1';
+const AI_MODEL = process.env.AI_MODEL || 'gpt-4o-mini';
+const aiEnabled = !!AI_API_KEY;
 
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('Connected to MongoDB Atlas'))
@@ -457,9 +464,168 @@ const mockTestResultSchema = new mongoose.Schema({
 });
 const MockTestResult = mongoose.model('MockTestResult', mockTestResultSchema);
 
+// ========== AI QUESTION GENERATION HELPERS ==========
+
+async function callAI(prompt) {
+  if (!aiEnabled) return null;
+  try {
+    const res = await fetch(`${AI_API_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: AI_MODEL,
+        messages: [
+          { role: 'system', content: 'You are an expert exam question generator. You generate multiple-choice questions from exam papers. You always respond with valid JSON only, no markdown, no explanations, no code blocks.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.7,
+        max_tokens: 4000
+      })
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error('AI API error:', errText);
+      return null;
+    }
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (err) {
+    console.error('AI call failed:', err);
+    return null;
+  }
+}
+
+async function generateQuestionsFromPDF(paperId, pdfPath, title, subject) {
+  try {
+    if (!fs.existsSync(pdfPath)) {
+      console.error('PDF file not found:', pdfPath);
+      return { success: false, error: 'PDF file not found' };
+    }
+
+    const pdfBuffer = fs.readFileSync(pdfPath);
+    const pdfData = await pdfParse(pdfBuffer);
+    let text = pdfData.text || '';
+
+    if (!text.trim()) {
+      return { success: false, error: 'Could not extract text from PDF. The PDF may be scanned/image-based.' };
+    }
+
+    // Truncate if too long (approx 8000 chars to stay within token limits)
+    const MAX_CHARS = 8000;
+    if (text.length > MAX_CHARS) {
+      text = text.substring(0, MAX_CHARS) + '\n\n[Content truncated due to length...]';
+    }
+
+    const prompt = `You are an expert exam question generator. I will give you the text content of a previous year exam paper (PYQ). Your task is to generate multiple-choice questions based on this paper.
+
+EXAM DETAILS:
+Title: ${title}
+Subject: ${subject}
+
+INSTRUCTIONS:
+1. Read through the entire paper content carefully.
+2. Generate multiple-choice questions. Aim for 10-25 questions depending on the paper length and content richness.
+3. For each question:
+   - Include some EXACT same questions from the paper if they are suitable as multiple-choice questions
+   - Also create NEW similar questions that test the same concepts and topics
+   - Each question must have exactly 4 options (A, B, C, D)
+   - Mark the correct answer with a 0-based index (0=A, 1=B, 2=C, 3=D)
+   - Assign marks: typically 1 mark per question, 2 marks for more complex questions
+   - Include difficulty level: easy, medium, or hard
+   - Include a topic tag for the question
+4. Ensure questions cover ALL major topics in the paper
+5. Return ONLY a valid JSON array with NO markdown formatting, NO code blocks, NO explanation text outside the JSON
+
+PAPER CONTENT:
+${text}
+
+JSON FORMAT (return ONLY this, no other text):
+[
+  {
+    "question": "Question text here",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correctAnswer": 0,
+    "marks": 1,
+    "difficulty": "medium",
+    "topic": "topic name"
+  }
+]`;
+
+    const aiResponse = await callAI(prompt);
+    if (!aiResponse) {
+      return { success: false, error: 'AI generation failed or AI API not configured.' };
+    }
+
+    // Clean up response - extract JSON from possible markdown code blocks
+    let cleanedResponse = aiResponse.trim();
+    if (cleanedResponse.startsWith('```json')) {
+      cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+    } else if (cleanedResponse.startsWith('```')) {
+      cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
+    }
+    cleanedResponse = cleanedResponse.trim();
+
+    let questions;
+    try {
+      questions = JSON.parse(cleanedResponse);
+    } catch (parseErr) {
+      console.error('AI JSON parse error:', parseErr.message, 'Raw response:', cleanedResponse.substring(0, 500));
+      return { success: false, error: 'AI returned invalid JSON format.' };
+    }
+
+    if (!Array.isArray(questions) || questions.length === 0) {
+      return { success: false, error: 'AI generated no valid questions.' };
+    }
+
+    // Validate and normalize each question
+    const validQuestions = [];
+    for (const q of questions) {
+      if (!q.question || !Array.isArray(q.options) || q.options.length !== 4) continue;
+      if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+      validQuestions.push({
+        paperId: new mongoose.Types.ObjectId(paperId),
+        question: q.question.trim(),
+        options: q.options.map(o => String(o).trim()),
+        correctAnswer: Math.round(q.correctAnswer),
+        marks: Number(q.marks) || 1,
+        difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
+        topic: q.topic || ''
+      });
+    }
+
+    if (validQuestions.length === 0) {
+      return { success: false, error: 'No valid questions after validation.' };
+    }
+
+    // Delete existing questions for this paper before saving new ones
+    await MockQuestion.deleteMany({ paperId: new mongoose.Types.ObjectId(paperId) });
+    await MockQuestion.insertMany(validQuestions);
+
+    // Update paper totals
+    const count = await MockQuestion.countDocuments({ paperId: new mongoose.Types.ObjectId(paperId) });
+    const totalMarksResult = await MockQuestion.aggregate([
+      { $match: { paperId: new mongoose.Types.ObjectId(paperId) } },
+      { $group: { _id: null, total: { $sum: '$marks' } } }
+    ]);
+
+    await MockTestPaper.findByIdAndUpdate(paperId, {
+      totalQuestions: count,
+      totalMarks: totalMarksResult.length > 0 ? totalMarksResult[0].total : 0
+    });
+
+    return { success: true, count: validQuestions.length, totalMarks: totalMarksResult.length > 0 ? totalMarksResult[0].total : 0 };
+  } catch (err) {
+    console.error('generateQuestionsFromPDF error:', err);
+    return { success: false, error: err.message };
+  }
+}
+
 // ========== MOCK TEST API ROUTES ==========
 
-// Admin: Upload PDF and create paper
+// Admin: Upload PDF and create paper (auto-generates questions via AI)
 app.post('/api/admin/mock-tests/upload', authMiddleware, adminMiddleware, upload.single('pdf'), async (req, res) => {
   try {
     const { title, subject, department, semester, year, duration } = req.body;
@@ -470,7 +636,26 @@ app.post('/api/admin/mock-tests/upload', authMiddleware, adminMiddleware, upload
       pdfUrl: req.file ? `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}` : ''
     });
     await paper.save();
-    res.status(201).json({ message: 'Paper uploaded. Now add questions.', paper });
+
+    // Trigger AI question generation in the background
+    if (req.file && aiEnabled) {
+      generateQuestionsFromPDF(paper._id, req.file.path, title, subject)
+        .then(result => {
+          if (result.success) {
+            console.log(`AI generated ${result.count} questions for paper ${paper._id}`);
+          } else {
+            console.error(`AI generation failed for paper ${paper._id}:`, result.error);
+          }
+        })
+        .catch(err => console.error('AI generation error:', err));
+    }
+
+    res.status(201).json({
+      message: aiEnabled
+        ? 'Paper uploaded. AI is generating questions in the background. Refresh in a moment to see them.'
+        : 'Paper uploaded. Please add questions manually or set up AI_API_KEY for automatic generation.',
+      paper
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to upload paper' });
@@ -549,10 +734,34 @@ app.get('/api/admin/mock-tests/:id/questions', authMiddleware, adminMiddleware, 
   }
 });
 
+// Admin: Regenerate questions with AI
+app.post('/api/admin/mock-tests/:id/generate', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const paper = await MockTestPaper.findById(req.params.id);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+    if (!paper.pdfFilePath || !fs.existsSync(paper.pdfFilePath)) {
+      return res.status(400).json({ error: 'PDF file not available for this paper' });
+    }
+    if (!aiEnabled) {
+      return res.status(400).json({ error: 'AI API not configured. Please set AI_API_KEY in environment variables.' });
+    }
+
+    const result = await generateQuestionsFromPDF(paper._id, paper.pdfFilePath, paper.title, paper.subject);
+    if (result.success) {
+      res.json({ success: true, message: `AI generated ${result.count} questions. Total marks: ${result.totalMarks}`, count: result.count, totalMarks: result.totalMarks });
+    } else {
+      res.status(500).json({ error: result.error || 'AI generation failed' });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error during AI generation' });
+  }
+});
+
 // User: List available papers
 app.get('/api/mock-tests/papers', authMiddleware, async (req, res) => {
   try {
-    const papers = await MockTestPaper.find({ status: 'active' }).select('-__v');
+    const papers = await MockTestPaper.find({ status: 'active', totalQuestions: { $gt: 0 } }).select('-__v');
     res.json(papers);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
