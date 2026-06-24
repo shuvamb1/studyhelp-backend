@@ -442,6 +442,14 @@ const mockTestPaperSchema = new mongoose.Schema({
   }],
   pdfUrl: String,       // legacy single PDF (kept for backward compat)
   pdfFilePath: String,  // legacy single PDF (kept for backward compat)
+  syllabusFiles: [{
+    filename: String,
+    originalName: String,
+    path: String,
+    url: String,
+    uploadedAt: { type: Date, default: Date.now }
+  }],
+  syllabusText: String, // cached extracted text from syllabus PDFs
   status: { type: String, default: 'active' },
   createdAt: { type: Date, default: Date.now }
 });
@@ -462,7 +470,7 @@ const MockQuestion = mongoose.model('MockQuestion', mockQuestionSchema);
 const mockTestResultSchema = new mongoose.Schema({
   userId: String, // can be MongoDB ObjectId (regular users) or 'admin_id' (admin)
   paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper' },
-  answers: [{ questionId: { type: mongoose.Schema.Types.Mixed }, selectedOption: Number }],
+  answers: [{ questionId: { type: mongoose.Schema.Types.Mixed }, selectedOption: Number, textAnswer: String }],
   score: Number,
   totalMarks: Number,
   correctCount: Number,
@@ -477,13 +485,16 @@ const MockTestResult = mongoose.model('MockTestResult', mockTestResultSchema);
 const testSessionSchema = new mongoose.Schema({
   paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper' },
   userId: String, // can be MongoDB ObjectId (regular users) or 'admin_id' (admin)
+  questionType: { type: String, enum: ['mcq', 'descriptive', 'mixed'], default: 'mcq' },
   questions: [{
     question: String,
     options: [String],
     correctAnswer: Number,
+    modelAnswer: String,
     marks: Number,
     difficulty: String,
-    topic: String
+    topic: String,
+    type: { type: String, enum: ['mcq', 'descriptive'], default: 'mcq' }
   }],
   totalMarks: Number,
   duration: Number,
@@ -505,7 +516,7 @@ async function callAI(prompt) {
       body: JSON.stringify({
         model: AI_MODEL,
         messages: [
-          { role: 'system', content: 'You are an expert exam question generator. You generate multiple-choice questions from exam papers. You always respond with valid JSON only, no markdown, no explanations, no code blocks.' },
+          { role: 'system', content: 'You are an expert exam question generator. You generate exam questions from exam papers and syllabi. You always respond with valid JSON only, no markdown, no explanations, no code blocks.' },
           { role: 'user', content: prompt }
         ],
         temperature: 0.7,
@@ -525,27 +536,12 @@ async function callAI(prompt) {
   }
 }
 
-// Extract text from all PDFs belonging to a paper
-async function extractTextFromAllPDFs(paper) {
+// Extract text from a list of PDF file paths
+async function extractTextFromPDFPaths(paths) {
   const texts = [];
-  const pdfFiles = [];
-
-  // Collect all PDF paths (both new pdfFiles array and legacy single pdf)
-  if (paper.pdfFiles && paper.pdfFiles.length > 0) {
-    for (const pdf of paper.pdfFiles) {
-      if (pdf.path && fs.existsSync(pdf.path)) pdfFiles.push(pdf.path);
-    }
-  }
-  if (paper.pdfFilePath && fs.existsSync(paper.pdfFilePath)) {
-    pdfFiles.push(paper.pdfFilePath);
-  }
-
-  if (pdfFiles.length === 0) {
-    return { success: false, error: 'No PDF files found for this paper' };
-  }
-
-  for (const pdfPath of pdfFiles) {
+  for (const pdfPath of paths) {
     try {
+      if (!fs.existsSync(pdfPath)) continue;
       const pdfBuffer = fs.readFileSync(pdfPath);
       const pdfData = await pdfParse(pdfBuffer);
       if (pdfData.text && pdfData.text.trim()) {
@@ -555,7 +551,24 @@ async function extractTextFromAllPDFs(paper) {
       console.error('PDF parse error for', pdfPath, ':', err.message);
     }
   }
+  return texts;
+}
 
+// Generate questions from ALL PDFs of a paper using AI
+async function extractTextFromAllPDFs(paper) {
+  const paths = [];
+  if (paper.pdfFiles && paper.pdfFiles.length > 0) {
+    for (const pdf of paper.pdfFiles) {
+      if (pdf.path) paths.push(pdf.path);
+    }
+  }
+  if (paper.pdfFilePath) paths.push(paper.pdfFilePath);
+
+  if (paths.length === 0) {
+    return { success: false, error: 'No PDF files found for this paper' };
+  }
+
+  const texts = await extractTextFromPDFPaths(paths);
   if (texts.length === 0) {
     return { success: false, error: 'Could not extract text from any PDF. The PDFs may be scanned/image-based.' };
   }
@@ -563,67 +576,152 @@ async function extractTextFromAllPDFs(paper) {
   return { success: true, text: texts.join('\n\n---\n\n') };
 }
 
-// Generate questions from ALL PDFs of a paper using AI
-async function generateQuestionsFromPaper(paper) {
-  try {
-    if (!aiEnabled) {
-      return { success: false, error: 'AI API not configured. Please set AI_API_KEY and AI_API_BASE environment variables.' };
+// Get both PYQ and syllabus texts from a paper
+async function getPaperTexts(paper) {
+  const pyqPaths = [];
+  if (paper.pdfFiles && paper.pdfFiles.length > 0) {
+    for (const pdf of paper.pdfFiles) {
+      if (pdf.path) pyqPaths.push(pdf.path);
     }
+  }
+  if (paper.pdfFilePath) pyqPaths.push(paper.pdfFilePath);
 
-    const extractResult = await extractTextFromAllPDFs(paper);
-    if (!extractResult.success) {
-      return extractResult;
+  const syllabusPaths = [];
+  if (paper.syllabusFiles && paper.syllabusFiles.length > 0) {
+    for (const pdf of paper.syllabusFiles) {
+      if (pdf.path) syllabusPaths.push(pdf.path);
     }
+  }
 
-    let combinedText = extractResult.text;
+  const [pyqTexts, syllabusTexts] = await Promise.all([
+    extractTextFromPDFPaths(pyqPaths),
+    extractTextFromPDFPaths(syllabusPaths)
+  ]);
 
-    // Truncate if too long (approx 12000 chars for Groq's larger context)
-    const MAX_CHARS = 12000;
-    if (combinedText.length > MAX_CHARS) {
-      combinedText = combinedText.substring(0, MAX_CHARS) + '\n\n[Additional content truncated...]';
-    }
+  let pyqText = pyqTexts.join('\n\n---\n\n');
+  let syllabusText = syllabusTexts.join('\n\n---\n\n');
 
-    const prompt = `You are an expert exam question generator. I have provided you with the text content of one or more previous year exam papers (PYQs). Your task is to generate a complete set of multiple-choice questions for a new mock test based on these papers.
+  if (!syllabusText && paper.syllabusText) {
+    syllabusText = paper.syllabusText;
+  }
+
+  return { pyqText, syllabusText };
+}
+
+function buildAIPrompt(questionType, paper, totalMarks, testDuration, pyqText, syllabusText) {
+  let typeInstructions = '';
+  let formatInstructions = '';
+
+  if (questionType === 'mcq') {
+    typeInstructions = `Generate ONLY Multiple Choice Questions (MCQ). Each question must have exactly 4 options (A, B, C, D). Mark the correct answer with a 0-based index (0=A, 1=B, 2=C, 3=D).`;
+    formatInstructions = `[
+  {
+    "question": "Question text here",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correctAnswer": 0,
+    "modelAnswer": "",
+    "marks": 1,
+    "difficulty": "medium",
+    "topic": "topic name",
+    "type": "mcq"
+  }
+]`;
+  } else if (questionType === 'descriptive') {
+    typeInstructions = `Generate ONLY Descriptive / Long Answer / Short Answer questions. These should NOT have multiple choice options. Instead, provide a model answer that would be expected. Set correctAnswer to -1 and options to an empty array.`;
+    formatInstructions = `[
+  {
+    "question": "Question text here",
+    "options": [],
+    "correctAnswer": -1,
+    "modelAnswer": "Expected answer summary here",
+    "marks": 5,
+    "difficulty": "medium",
+    "topic": "topic name",
+    "type": "descriptive"
+  }
+]`;
+  } else {
+    typeInstructions = `Generate a MIX of Multiple Choice Questions (MCQ) and Descriptive questions. For MCQs, each must have exactly 4 options (A, B, C, D) with correctAnswer as 0-based index. For Descriptive questions, options should be an empty array and correctAnswer should be -1, with a modelAnswer provided.`;
+    formatInstructions = `[
+  {
+    "question": "MCQ question text",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correctAnswer": 0,
+    "modelAnswer": "",
+    "marks": 1,
+    "difficulty": "medium",
+    "topic": "topic name",
+    "type": "mcq"
+  },
+  {
+    "question": "Descriptive question text",
+    "options": [],
+    "correctAnswer": -1,
+    "modelAnswer": "Expected answer summary",
+    "marks": 5,
+    "difficulty": "medium",
+    "topic": "topic name",
+    "type": "descriptive"
+  }
+]`;
+  }
+
+  const prompt = `You are an expert exam question generator. I have provided you with:
+1. Previous Year Exam Papers (PYQs) - to understand the difficulty level and pattern
+2. Syllabus Content - to guide the topics and coverage
+
+Your task is to generate ${questionType.toUpperCase()} type questions for a new mock test.
 
 PAPER / EXAM DETAILS:
 - Paper Name: ${paper.title}
 - Subject: ${paper.subject}
 - Department: ${paper.department || 'N/A'}
 - Semester: ${paper.semester || 'N/A'}
-- Total Marks Required: ${paper.totalMarks || 'Auto-calculate'}
-- Duration: ${paper.duration || 60} minutes
-- Target Question Count: approximately ${paper.totalMarks || 30} marks worth of questions (typically 1 mark per question, some 2-mark questions for complex topics)
+- Total Marks Required: ${totalMarks}
+- Duration: ${testDuration} minutes
+- Question Type: ${questionType.toUpperCase()}
 
 INSTRUCTIONS:
-1. Read through ALL the provided PYQ content carefully.
-2. Generate a complete set of multiple-choice questions that would be suitable for a ${paper.totalMarks || 'full'} mark exam on "${paper.title}" lasting ${paper.duration || 60} minutes.
-3. The total marks of ALL generated questions should equal or closely match the required Total Marks (${paper.totalMarks || 'auto'}).
-4. For each question:
-   - Include some EXACT same questions from the PYQs if they are suitable as multiple-choice questions
-   - Also create NEW similar questions that test the same concepts and topics (vary the wording, numbers, or scenarios)
-   - Each question must have exactly 4 options (A, B, C, D)
-   - Mark the correct answer with a 0-based index (0=A, 1=B, 2=C, 3=D)
-   - Assign marks per question: typically 1 mark per question, 2 marks for more complex/computational questions
-   - Include difficulty level: easy, medium, or hard
-   - Include a topic tag for each question
-5. Ensure questions cover ALL major topics from the PYQs evenly
-6. Vary question types: conceptual, definitional, application-based, numerical where applicable
-7. Return ONLY a valid JSON array with NO markdown formatting, NO code blocks, NO explanation text outside the JSON
+1. Read through ALL the provided PYQ content carefully to understand the difficulty level and pattern.
+2. Read through the syllabus content to understand the topics to cover.
+3. Generate questions according to the syllabus content. The questions must be at the SAME DIFFICULTY LEVEL as the PYQs.
+4. Cover ALL major topics from the syllabus evenly.
+5. The total marks of ALL generated questions should closely match ${totalMarks} marks.
+6. ${typeInstructions}
+7. Include difficulty level (easy, medium, or hard) and a topic tag for each question.
+8. Return ONLY a valid JSON array with NO markdown formatting, NO code blocks, NO explanation text outside the JSON.
 
-PREVIOUS YEAR EXAM PAPER CONTENT:
-${combinedText}
+PREVIOUS YEAR EXAM PAPER CONTENT (PYQs):
+${pyqText || 'No PYQ content provided.'}
+
+SYLLABUS CONTENT:
+${syllabusText || 'No syllabus provided. Generate based on PYQ topics.'}
 
 JSON FORMAT (return ONLY this array, no other text):
-[
-  {
-    "question": "Question text here",
-    "options": ["Option A", "Option B", "Option C", "Option D"],
-    "correctAnswer": 0,
-    "marks": 1,
-    "difficulty": "medium",
-    "topic": "topic name"
-  }
-]`;
+${formatInstructions}`;
+
+  return prompt;
+}
+
+// Generate questions from ALL PDFs of a paper using AI
+async function generateQuestionsFromPaper(paper, questionType = 'mcq') {
+  try {
+    if (!aiEnabled) {
+      return { success: false, error: 'AI API not configured. Please set AI_API_KEY and AI_API_BASE environment variables.' };
+    }
+
+    const { pyqText, syllabusText } = await getPaperTexts(paper);
+    if (!pyqText) {
+      return { success: false, error: 'No PYQ text found for this paper.' };
+    }
+
+    let combinedPyqText = pyqText;
+    const MAX_CHARS = 12000;
+    if (combinedPyqText.length > MAX_CHARS) {
+      combinedPyqText = combinedPyqText.substring(0, MAX_CHARS) + '\n\n[Additional PYQ content truncated...]';
+    }
+
+    const prompt = buildAIPrompt(questionType, paper, paper.totalMarks || 30, paper.duration || 60, combinedPyqText, syllabusText);
 
     const aiResponse = await callAI(prompt);
     if (!aiResponse) {
@@ -655,16 +753,25 @@ JSON FORMAT (return ONLY this array, no other text):
     // Validate and normalize each question
     const questions = [];
     for (const q of rawQuestions) {
-      if (!q.question || !Array.isArray(q.options) || q.options.length !== 4) continue;
-      if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+      if (!q.question) continue;
+      const qType = q.type === 'descriptive' ? 'descriptive' : 'mcq';
+      if (qType === 'mcq') {
+        if (!Array.isArray(q.options) || q.options.length !== 4) continue;
+        if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+      } else {
+        // descriptive: options can be empty, correctAnswer should be -1
+        if (!Array.isArray(q.options)) q.options = [];
+      }
       questions.push({
         paperId: new mongoose.Types.ObjectId(paper._id),
         question: q.question.trim(),
-        options: q.options.map(o => String(o).trim()),
-        correctAnswer: Math.round(q.correctAnswer),
+        options: Array.isArray(q.options) ? q.options.map(o => String(o).trim()) : [],
+        correctAnswer: qType === 'descriptive' ? -1 : Math.round(q.correctAnswer),
+        modelAnswer: q.modelAnswer || '',
         marks: Number(q.marks) || 1,
         difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
-        topic: q.topic || ''
+        topic: q.topic || '',
+        type: qType
       });
     }
 
@@ -792,6 +899,46 @@ app.post('/api/admin/mock-tests/:id/pdfs', authMiddleware, adminMiddleware, uplo
   }
 });
 
+// Admin: Upload Syllabus PDFs to an existing paper
+app.post('/api/admin/mock-tests/:id/syllabus', authMiddleware, adminMiddleware, upload.array('syllabus', 5), async (req, res) => {
+  try {
+    const paper = await MockTestPaper.findById(req.params.id);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No syllabus PDF files uploaded' });
+    }
+
+    const newFiles = req.files.map(file => ({
+      filename: file.filename,
+      originalName: file.originalname,
+      path: file.path,
+      url: `${req.protocol}://${req.get('host')}/uploads/${file.filename}`,
+      uploadedAt: new Date()
+    }));
+
+    paper.syllabusFiles = paper.syllabusFiles || [];
+    paper.syllabusFiles.push(...newFiles);
+
+    // Extract and cache syllabus text
+    const syllabusTexts = await extractTextFromPDFPaths(newFiles.map(f => f.path));
+    if (syllabusTexts.length > 0) {
+      const existingText = paper.syllabusText || '';
+      const newText = syllabusTexts.join('\n\n---\n\n');
+      paper.syllabusText = existingText ? existingText + '\n\n---\n\n' + newText : newText;
+    }
+
+    await paper.save();
+    res.json({
+      message: `${req.files.length} syllabus PDF(s) uploaded successfully.`,
+      syllabusCount: paper.syllabusFiles.length
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to upload syllabus PDFs' });
+  }
+});
+
 // Admin: Upload PDF and create paper (legacy - kept for backward compatibility)
 app.post('/api/admin/mock-tests/upload', authMiddleware, adminMiddleware, upload.single('pdf'), async (req, res) => {
   try {
@@ -902,6 +1049,14 @@ app.delete('/api/admin/mock-tests/:id', authMiddleware, adminMiddleware, async (
     if (paper.pdfFilePath && fs.existsSync(paper.pdfFilePath)) {
       try { fs.unlinkSync(paper.pdfFilePath); } catch (e) { /* ignore */ }
     }
+    // Delete syllabus files
+    if (paper.syllabusFiles && paper.syllabusFiles.length > 0) {
+      for (const pdf of paper.syllabusFiles) {
+        if (pdf.path && fs.existsSync(pdf.path)) {
+          try { fs.unlinkSync(pdf.path); } catch (e) { /* ignore */ }
+        }
+      }
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -964,67 +1119,28 @@ app.post('/api/mock-tests/:id/start', authMiddleware, async (req, res) => {
     const paper = await MockTestPaper.findById(req.params.id);
     if (!paper) return res.status(404).json({ error: 'Paper not found' });
 
-    const { marks, duration } = req.body;
+    const { marks, duration, questionType } = req.body;
     const totalMarks = Number(marks) || 30;
     const testDuration = Number(duration) || 60;
+    const qType = ['mcq', 'descriptive', 'mixed'].includes(questionType) ? questionType : 'mcq';
 
     if (!aiEnabled) {
       return res.status(400).json({ error: 'AI is not configured on this server. Please contact admin.' });
     }
 
-    // Extract text from all PDFs
-    const extractResult = await extractTextFromAllPDFs(paper);
-    if (!extractResult.success) {
-      return res.status(400).json({ error: extractResult.error });
+    // Extract text from all PDFs (PYQs + syllabus)
+    const { pyqText, syllabusText } = await getPaperTexts(paper);
+    if (!pyqText) {
+      return res.status(400).json({ error: 'No PYQ text found for this paper.' });
     }
 
-    let combinedText = extractResult.text;
+    let combinedPyqText = pyqText;
     const MAX_CHARS = 12000;
-    if (combinedText.length > MAX_CHARS) {
-      combinedText = combinedText.substring(0, MAX_CHARS) + '\n\n[Additional content truncated...]';
+    if (combinedPyqText.length > MAX_CHARS) {
+      combinedPyqText = combinedPyqText.substring(0, MAX_CHARS) + '\n\n[Additional PYQ content truncated...]';
     }
 
-    const prompt = `You are an expert exam question generator. I have provided you with the text content of one or more previous year exam papers (PYQs). Your task is to generate a complete set of multiple-choice questions for a mock test based on these papers.
-
-EXAM DETAILS:
-- Paper Name: ${paper.title}
-- Subject: ${paper.subject || 'N/A'}
-- Department: ${paper.department || 'N/A'}
-- Semester: ${paper.semester || 'N/A'}
-- Total Marks Required: ${totalMarks}
-- Duration: ${testDuration} minutes
-- Target: approximately ${totalMarks} marks worth of questions (typically 1 mark per question, some 2-mark questions for complex topics)
-
-INSTRUCTIONS:
-1. Read through ALL the provided PYQ content carefully.
-2. Generate a complete set of multiple-choice questions for a ${totalMarks}-mark exam on "${paper.title}" lasting ${testDuration} minutes.
-3. The total marks of ALL generated questions should closely match ${totalMarks} marks.
-4. For each question:
-   - Include some EXACT same questions from the PYQs if they are suitable as multiple-choice questions
-   - Also create NEW similar questions that test the same concepts and topics (vary wording, numbers, or scenarios)
-   - Each question must have exactly 4 options (A, B, C, D)
-   - Mark the correct answer with a 0-based index (0=A, 1=B, 2=C, 3=D)
-   - Assign marks per question: typically 1 mark per question, 2 marks for more complex/computational questions
-   - Include difficulty level: easy, medium, or hard
-   - Include a topic tag for each question
-5. Ensure questions cover ALL major topics from the PYQs evenly
-6. Vary question types: conceptual, definitional, application-based, numerical where applicable
-7. Return ONLY a valid JSON array with NO markdown formatting, NO code blocks, NO explanation text outside the JSON
-
-PREVIOUS YEAR EXAM PAPER CONTENT:
-${combinedText}
-
-JSON FORMAT (return ONLY this array, no other text):
-[
-  {
-    "question": "Question text here",
-    "options": ["Option A", "Option B", "Option C", "Option D"],
-    "correctAnswer": 0,
-    "marks": 1,
-    "difficulty": "medium",
-    "topic": "topic name"
-  }
-]`;
+    const prompt = buildAIPrompt(qType, paper, totalMarks, testDuration, combinedPyqText, syllabusText);
 
     const aiResponse = await callAI(prompt);
     if (!aiResponse) {
@@ -1056,16 +1172,24 @@ JSON FORMAT (return ONLY this array, no other text):
     const questions = [];
     let actualTotalMarks = 0;
     for (const q of rawQuestions) {
-      if (!q.question || !Array.isArray(q.options) || q.options.length !== 4) continue;
-      if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+      if (!q.question) continue;
+      const itemType = q.type === 'descriptive' ? 'descriptive' : 'mcq';
+      if (itemType === 'mcq') {
+        if (!Array.isArray(q.options) || q.options.length !== 4) continue;
+        if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+      } else {
+        if (!Array.isArray(q.options)) q.options = [];
+      }
       const qMarks = Number(q.marks) || 1;
       questions.push({
         question: q.question.trim(),
-        options: q.options.map(o => String(o).trim()),
-        correctAnswer: Math.round(q.correctAnswer),
+        options: Array.isArray(q.options) ? q.options.map(o => String(o).trim()) : [],
+        correctAnswer: itemType === 'descriptive' ? -1 : Math.round(q.correctAnswer),
+        modelAnswer: q.modelAnswer || '',
         marks: qMarks,
         difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
-        topic: q.topic || ''
+        topic: q.topic || '',
+        type: itemType
       });
       actualTotalMarks += qMarks;
     }
@@ -1078,6 +1202,7 @@ JSON FORMAT (return ONLY this array, no other text):
     const session = new TestSession({
       paperId: paper._id,
       userId: req.user.id,
+      questionType: qType,
       questions,
       totalMarks: actualTotalMarks,
       duration: testDuration
@@ -1091,7 +1216,8 @@ JSON FORMAT (return ONLY this array, no other text):
       options: q.options,
       marks: q.marks,
       difficulty: q.difficulty,
-      topic: q.topic
+      topic: q.topic,
+      type: q.type
     }));
 
     res.json({
@@ -1100,7 +1226,8 @@ JSON FORMAT (return ONLY this array, no other text):
       questions: clientQuestions,
       totalMarks: actualTotalMarks,
       duration: testDuration,
-      questionCount: questions.length
+      questionCount: questions.length,
+      questionType: qType
     });
   } catch (err) {
     console.error('Start test error:', err);
@@ -1120,11 +1247,35 @@ app.post('/api/mock-tests/:id/submit', authMiddleware, async (req, res) => {
     const questions = session.questions;
     const userAnswers = answers || [];
 
-    let score = 0, correct = 0, wrong = 0, unanswered = 0;
+    let score = 0, correct = 0, wrong = 0, unanswered = 0, descriptiveCount = 0;
     const answerMap = {};
-    userAnswers.forEach(a => { answerMap[a.questionId] = a.selectedOption; });
+    const textAnswerMap = {};
+    userAnswers.forEach(a => {
+      answerMap[a.questionId] = a.selectedOption;
+      if (a.textAnswer !== undefined && a.textAnswer !== null) {
+        textAnswerMap[a.questionId] = a.textAnswer;
+      }
+    });
 
     const detailedResults = questions.map((q, idx) => {
+      if (q.type === 'descriptive') {
+        const textAnswer = textAnswerMap[idx] || '';
+        const isUnanswered = !textAnswer || textAnswer.trim() === '';
+        if (isUnanswered) unanswered++;
+        else descriptiveCount++;
+        return {
+          questionId: idx,
+          question: q.question,
+          options: q.options,
+          correctAnswer: q.correctAnswer,
+          modelAnswer: q.modelAnswer || '',
+          selectedOption: -1,
+          textAnswer,
+          isCorrect: null,
+          marks: q.marks,
+          type: 'descriptive'
+        };
+      }
       const selected = answerMap[idx];
       const isCorrect = selected === q.correctAnswer;
       const isUnanswered = selected === undefined || selected === null;
@@ -1138,16 +1289,23 @@ app.post('/api/mock-tests/:id/submit', authMiddleware, async (req, res) => {
         question: q.question,
         options: q.options,
         correctAnswer: q.correctAnswer,
+        modelAnswer: q.modelAnswer || '',
         selectedOption: selected,
+        textAnswer: '',
         isCorrect,
-        marks: q.marks
+        marks: q.marks,
+        type: 'mcq'
       };
     });
 
     const result = new MockTestResult({
       userId: req.user.id,
       paperId: req.params.id,
-      answers: userAnswers.map(a => ({ questionId: a.questionId, selectedOption: a.selectedOption })),
+      answers: userAnswers.map(a => ({
+        questionId: a.questionId,
+        selectedOption: a.selectedOption,
+        textAnswer: a.textAnswer || ''
+      })),
       score,
       totalMarks: session.totalMarks,
       correctCount: correct,
