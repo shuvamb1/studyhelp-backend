@@ -460,7 +460,7 @@ const mockQuestionSchema = new mongoose.Schema({
 const MockQuestion = mongoose.model('MockQuestion', mockQuestionSchema);
 
 const mockTestResultSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'Student' },
+  userId: String, // can be MongoDB ObjectId (regular users) or 'admin_id' (admin)
   paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper' },
   answers: [{ questionId: { type: mongoose.Schema.Types.Mixed }, selectedOption: Number }],
   score: Number,
