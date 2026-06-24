@@ -132,11 +132,49 @@ mongoose.connection.once('open', () => {
   seedMaterialsIfEmpty().catch((err) => console.error('Material seed failed:', err));
 });
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'uploads/'),
-  filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+// GridFS bucket for persistent file storage (survives redeploys)
+let gridfsBucket;
+mongoose.connection.once('open', () => {
+  gridfsBucket = new mongoose.mongo.GridFSBucket(mongoose.connection.db, {
+    bucketName: 'uploads'
+  });
+  console.log('GridFS bucket initialized');
 });
-const upload = multer({ storage });
+
+// Use memory storage so files are passed as buffers (then stored in GridFS)
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Helper: upload a buffer to GridFS
+async function uploadBufferToGridFS(buffer, filename) {
+  return new Promise((resolve, reject) => {
+    const uploadStream = gridfsBucket.openUploadStream(filename, {
+      contentType: 'application/pdf'
+    });
+    uploadStream.on('finish', () => resolve(uploadStream.id));
+    uploadStream.on('error', reject);
+    uploadStream.end(buffer);
+  });
+}
+
+// Helper: download a GridFS file into a Buffer
+async function downloadFromGridFS(fileId) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const downloadStream = gridfsBucket.openDownloadStream(new mongoose.Types.ObjectId(fileId));
+    downloadStream.on('data', chunk => chunks.push(chunk));
+    downloadStream.on('end', () => resolve(Buffer.concat(chunks)));
+    downloadStream.on('error', reject);
+  });
+}
+
+// Helper: delete a file from GridFS
+async function deleteFromGridFS(fileId) {
+  try {
+    await gridfsBucket.delete(new mongoose.Types.ObjectId(fileId));
+  } catch (err) {
+    console.error('GridFS delete error:', err.message);
+  }
+}
 
 const authMiddleware = (req, res, next) => {
   const token = req.header('Authorization');
@@ -434,15 +472,17 @@ const mockTestPaperSchema = new mongoose.Schema({
   totalMarks: { type: Number, default: 0 },
   totalQuestions: { type: Number, default: 0 },
   pdfFiles: [{
+    gridfsId: { type: mongoose.Schema.Types.ObjectId, index: true },
     filename: String,
     originalName: String,
-    path: String,
-    url: String,
+    path: String,        // legacy disk path (kept for backward compat)
+    url: String,         // legacy URL (kept for backward compat)
     uploadedAt: { type: Date, default: Date.now }
   }],
   pdfUrl: String,       // legacy single PDF (kept for backward compat)
   pdfFilePath: String,  // legacy single PDF (kept for backward compat)
   syllabusFiles: [{
+    gridfsId: { type: mongoose.Schema.Types.ObjectId, index: true },
     filename: String,
     originalName: String,
     path: String,
@@ -536,39 +576,59 @@ async function callAI(prompt) {
   }
 }
 
-// Extract text from a list of PDF file paths
-async function extractTextFromPDFPaths(paths) {
+// Extract text from PDF buffers
+async function extractTextFromBuffers(buffers) {
   const texts = [];
-  for (const pdfPath of paths) {
+  for (const buffer of buffers) {
     try {
-      if (!fs.existsSync(pdfPath)) continue;
-      const pdfBuffer = fs.readFileSync(pdfPath);
-      const pdfData = await pdfParse(pdfBuffer);
+      const pdfData = await pdfParse(buffer);
       if (pdfData.text && pdfData.text.trim()) {
         texts.push(pdfData.text.trim());
       }
     } catch (err) {
-      console.error('PDF parse error for', pdfPath, ':', err.message);
+      console.error('PDF parse error:', err.message);
     }
   }
   return texts;
 }
 
-// Generate questions from ALL PDFs of a paper using AI
-async function extractTextFromAllPDFs(paper) {
-  const paths = [];
-  if (paper.pdfFiles && paper.pdfFiles.length > 0) {
-    for (const pdf of paper.pdfFiles) {
-      if (pdf.path) paths.push(pdf.path);
+// Extract text from a list of file objects (with gridfsId or legacy path)
+async function extractTextFromFileObjects(fileObjects) {
+  const texts = [];
+  for (const file of fileObjects) {
+    try {
+      let buffer = null;
+      if (file.gridfsId) {
+        buffer = await downloadFromGridFS(file.gridfsId);
+      } else if (file.path && fs.existsSync(file.path)) {
+        buffer = fs.readFileSync(file.path);
+      }
+      if (!buffer) continue;
+      const pdfData = await pdfParse(buffer);
+      if (pdfData.text && pdfData.text.trim()) {
+        texts.push(pdfData.text.trim());
+      }
+    } catch (err) {
+      console.error('PDF parse error for', file.originalName || file.filename, ':', err.message);
     }
   }
-  if (paper.pdfFilePath) paths.push(paper.pdfFilePath);
+  return texts;
+}
 
-  if (paths.length === 0) {
+// Extract text from all PDFs of a paper (legacy wrapper)
+async function extractTextFromAllPDFs(paper) {
+  const files = (paper.pdfFiles || []).filter(f => f.gridfsId || (f.path && fs.existsSync(f.path)));
+  if (files.length === 0 && paper.pdfFilePath && fs.existsSync(paper.pdfFilePath)) {
+    // Legacy single PDF fallback
+    const texts = await extractTextFromBuffers([fs.readFileSync(paper.pdfFilePath)]);
+    if (texts.length > 0) return { success: true, text: texts.join('\n\n---\n\n') };
+  }
+
+  if (files.length === 0) {
     return { success: false, error: 'No PDF files found for this paper' };
   }
 
-  const texts = await extractTextFromPDFPaths(paths);
+  const texts = await extractTextFromFileObjects(files);
   if (texts.length === 0) {
     return { success: false, error: 'Could not extract text from any PDF. The PDFs may be scanned/image-based.' };
   }
@@ -578,28 +638,25 @@ async function extractTextFromAllPDFs(paper) {
 
 // Get both PYQ and syllabus texts from a paper
 async function getPaperTexts(paper) {
-  const pyqPaths = [];
-  if (paper.pdfFiles && paper.pdfFiles.length > 0) {
-    for (const pdf of paper.pdfFiles) {
-      if (pdf.path) pyqPaths.push(pdf.path);
-    }
-  }
-  if (paper.pdfFilePath) pyqPaths.push(paper.pdfFilePath);
+  const pyqFiles = (paper.pdfFiles || []).filter(f => f.gridfsId || (f.path && fs.existsSync(f.path)));
+  const syllabusFiles = (paper.syllabusFiles || []).filter(f => f.gridfsId || (f.path && fs.existsSync(f.path)));
 
-  const syllabusPaths = [];
-  if (paper.syllabusFiles && paper.syllabusFiles.length > 0) {
-    for (const pdf of paper.syllabusFiles) {
-      if (pdf.path) syllabusPaths.push(pdf.path);
-    }
-  }
+  let pyqText = '';
+  let syllabusText = '';
 
   const [pyqTexts, syllabusTexts] = await Promise.all([
-    extractTextFromPDFPaths(pyqPaths),
-    extractTextFromPDFPaths(syllabusPaths)
+    extractTextFromFileObjects(pyqFiles),
+    extractTextFromFileObjects(syllabusFiles)
   ]);
 
-  let pyqText = pyqTexts.join('\n\n---\n\n');
-  let syllabusText = syllabusTexts.join('\n\n---\n\n');
+  pyqText = pyqTexts.join('\n\n---\n\n');
+  syllabusText = syllabusTexts.join('\n\n---\n\n');
+
+  // Legacy fallback for single PDF
+  if (!pyqText && paper.pdfFilePath && fs.existsSync(paper.pdfFilePath)) {
+    const legacyTexts = await extractTextFromBuffers([fs.readFileSync(paper.pdfFilePath)]);
+    pyqText = legacyTexts.join('\n\n---\n\n');
+  }
 
   if (!syllabusText && paper.syllabusText) {
     syllabusText = paper.syllabusText;
@@ -817,16 +874,14 @@ app.post('/api/admin/mock-tests/upload', authMiddleware, adminMiddleware, upload
     const paper = new MockTestPaper({
       title, subject, department, semester, year,
       totalMarks: Number(totalMarks) || 0,
-      duration: Number(duration) || 60,
-      pdfFilePath: req.file ? req.file.path : '',
-      pdfUrl: req.file ? `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}` : ''
+      duration: Number(duration) || 60
     });
     if (req.file) {
+      const gridfsId = await uploadBufferToGridFS(req.file.buffer, req.file.originalname);
       paper.pdfFiles = [{
-        filename: req.file.filename,
+        gridfsId,
+        filename: req.file.originalname,
         originalName: req.file.originalname,
-        path: req.file.path,
-        url: `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`,
         uploadedAt: new Date()
       }];
     }
@@ -871,21 +926,19 @@ app.post('/api/admin/mock-tests/:id/pdfs', authMiddleware, adminMiddleware, uplo
       return res.status(400).json({ error: 'No PDF files uploaded' });
     }
 
-    const newFiles = req.files.map(file => ({
-      filename: file.filename,
-      originalName: file.originalname,
-      path: file.path,
-      url: `${req.protocol}://${req.get('host')}/uploads/${file.filename}`,
-      uploadedAt: new Date()
-    }));
+    const newFiles = [];
+    for (const file of req.files) {
+      const gridfsId = await uploadBufferToGridFS(file.buffer, file.originalname);
+      newFiles.push({
+        gridfsId,
+        filename: file.originalname,
+        originalName: file.originalname,
+        uploadedAt: new Date()
+      });
+    }
 
     paper.pdfFiles = paper.pdfFiles || [];
     paper.pdfFiles.push(...newFiles);
-
-    if (newFiles.length > 0) {
-      paper.pdfFilePath = newFiles[0].path;
-      paper.pdfUrl = newFiles[0].url;
-    }
 
     await paper.save();
     res.json({
@@ -909,19 +962,24 @@ app.post('/api/admin/mock-tests/:id/syllabus', authMiddleware, adminMiddleware, 
       return res.status(400).json({ error: 'No syllabus PDF files uploaded' });
     }
 
-    const newFiles = req.files.map(file => ({
-      filename: file.filename,
-      originalName: file.originalname,
-      path: file.path,
-      url: `${req.protocol}://${req.get('host')}/uploads/${file.filename}`,
-      uploadedAt: new Date()
-    }));
+    const newFiles = [];
+    const buffers = [];
+    for (const file of req.files) {
+      const gridfsId = await uploadBufferToGridFS(file.buffer, file.originalname);
+      newFiles.push({
+        gridfsId,
+        filename: file.originalname,
+        originalName: file.originalname,
+        uploadedAt: new Date()
+      });
+      buffers.push(file.buffer);
+    }
 
     paper.syllabusFiles = paper.syllabusFiles || [];
     paper.syllabusFiles.push(...newFiles);
 
     // Extract and cache syllabus text
-    const syllabusTexts = await extractTextFromPDFPaths(newFiles.map(f => f.path));
+    const syllabusTexts = await extractTextFromBuffers(req.files.map(f => f.buffer));
     if (syllabusTexts.length > 0) {
       const existingText = paper.syllabusText || '';
       const newText = syllabusTexts.join('\n\n---\n\n');
@@ -946,16 +1004,14 @@ app.post('/api/admin/mock-tests/upload', authMiddleware, adminMiddleware, upload
     const paper = new MockTestPaper({
       title, subject, department, semester, year,
       totalMarks: Number(totalMarks) || 0,
-      duration: Number(duration) || 60,
-      pdfFilePath: req.file ? req.file.path : '',
-      pdfUrl: req.file ? `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}` : ''
+      duration: Number(duration) || 60
     });
     if (req.file) {
+      const gridfsId = await uploadBufferToGridFS(req.file.buffer, req.file.originalname);
       paper.pdfFiles = [{
-        filename: req.file.filename,
+        gridfsId,
+        filename: req.file.originalname,
         originalName: req.file.originalname,
-        path: req.file.path,
-        url: `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`,
         uploadedAt: new Date()
       }];
     }
@@ -1038,9 +1094,12 @@ app.delete('/api/admin/mock-tests/:id', authMiddleware, adminMiddleware, async (
     const paper = await MockTestPaper.findByIdAndDelete(req.params.id);
     if (!paper) return res.status(404).json({ error: 'Paper not found' });
 
-    // Delete all associated PDF files
+    // Delete all associated PDF files from GridFS and disk
     if (paper.pdfFiles && paper.pdfFiles.length > 0) {
       for (const pdf of paper.pdfFiles) {
+        if (pdf.gridfsId) {
+          try { await deleteFromGridFS(pdf.gridfsId); } catch (e) { /* ignore */ }
+        }
         if (pdf.path && fs.existsSync(pdf.path)) {
           try { fs.unlinkSync(pdf.path); } catch (e) { /* ignore */ }
         }
@@ -1049,9 +1108,12 @@ app.delete('/api/admin/mock-tests/:id', authMiddleware, adminMiddleware, async (
     if (paper.pdfFilePath && fs.existsSync(paper.pdfFilePath)) {
       try { fs.unlinkSync(paper.pdfFilePath); } catch (e) { /* ignore */ }
     }
-    // Delete syllabus files
+    // Delete syllabus files from GridFS and disk
     if (paper.syllabusFiles && paper.syllabusFiles.length > 0) {
       for (const pdf of paper.syllabusFiles) {
+        if (pdf.gridfsId) {
+          try { await deleteFromGridFS(pdf.gridfsId); } catch (e) { /* ignore */ }
+        }
         if (pdf.path && fs.existsSync(pdf.path)) {
           try { fs.unlinkSync(pdf.path); } catch (e) { /* ignore */ }
         }
@@ -1343,6 +1405,18 @@ app.get('/api/mock-tests/results', authMiddleware, async (req, res) => {
     res.json(results);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Serve files from GridFS (replaces /uploads static route for GridFS-stored files)
+app.get('/api/files/:gridfsId', async (req, res) => {
+  try {
+    const fileId = req.params.gridfsId;
+    const buffer = await downloadFromGridFS(fileId);
+    res.set('Content-Type', 'application/pdf');
+    res.send(buffer);
+  } catch (err) {
+    res.status(404).json({ error: 'File not found' });
   }
 });
 
