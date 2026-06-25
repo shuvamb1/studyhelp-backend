@@ -675,13 +675,13 @@ function getTargetDifficulty(percentage) {
 function getDifficultyInstructions(targetDifficulty) {
   switch (targetDifficulty) {
     case 'easy':
-      return `Generate EASY-level questions that still require genuine understanding. Focus on conceptual application, moderate reasoning, and standard problem-solving. Avoid trivial or one-liner questions. The questions should test whether the student truly understands the concepts, not just memorized them. Each question should require at least 2-3 logical steps to arrive at the answer.`;
+      return `Generate EASY-level questions. Focus on fundamental concepts, direct recall, basic definitions, and straightforward application. Most questions should be simple and accessible, requiring only basic understanding. A few may involve light reasoning (1-2 steps).`;
     case 'medium-hard':
-      return `Generate HARDER questions that are noticeably MORE DIFFICULT than the PYQs. Focus on deep conceptual analysis, complex multi-step reasoning, edge cases, and advanced application. Include questions that require synthesis of multiple concepts, non-standard approaches, and careful thought. The questions should challenge even well-prepared students.`;
+      return `Generate MEDIUM-HARD questions that are slightly harder than the PYQs. Include more challenging application problems, multi-step reasoning, and some non-standard scenarios. About 60% medium and 40% hard, giving a noticeable step up from the PYQ baseline.`;
     case 'hard':
-      return `Generate EXPERT-LEVEL questions that are SIGNIFICANTLY HARDER than the PYQs. Focus on advanced theoretical concepts, novel problem-solving scenarios, complex derivations and proofs, interdisciplinary application, and deep reasoning. Questions should require extensive analysis, creative thinking, and mastery of the subject. These should challenge the top-performing students.`;
+      return `Generate HARD questions that are more challenging than the PYQs. Include advanced application, multi-step analysis, and some edge cases. About 50% hard and 50% medium-hard. Questions should be challenging but still solvable with solid preparation.`;
     default:
-      return `Generate MEDIUM-level questions that are MORE CHALLENGING than typical PYQs. Include a balanced mix of conceptual application, multi-step reasoning, and problem-solving questions. Avoid simple recall questions. Focus on questions that require understanding, analysis, and application of concepts in non-obvious ways.`;
+      return `Generate MEDIUM-level questions that match the PYQ difficulty. Include a balanced mix of basic recall, conceptual understanding, and moderate problem-solving. About 30% easy, 50% medium, and 20% hard. Keep questions accessible to students with regular preparation.`;
   }
 }
 
