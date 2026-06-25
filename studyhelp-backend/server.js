@@ -665,7 +665,27 @@ async function getPaperTexts(paper) {
   return { pyqText, syllabusText };
 }
 
-function buildAIPrompt(questionType, paper, totalMarks, testDuration, pyqText, syllabusText) {
+function getTargetDifficulty(percentage) {
+  if (percentage >= 90) return 'hard';
+  if (percentage >= 75) return 'medium-hard';
+  if (percentage >= 50) return 'medium';
+  return 'easy';
+}
+
+function getDifficultyInstructions(targetDifficulty) {
+  switch (targetDifficulty) {
+    case 'easy':
+      return `Generate EASY questions. Focus on fundamental concepts, direct recall, definitions, and basic application. The questions should be noticeably EASIER than the PYQs. Most questions should be straightforward with clear answers.`;
+    case 'medium-hard':
+      return `Generate questions that are SLIGHTLY HARDER than the PYQs. Include a mix of medium and hard questions, with emphasis on harder application-level problems, multi-step reasoning, and less common scenarios.`;
+    case 'hard':
+      return `Generate HARD questions. Focus on advanced concepts, complex multi-step application, deep reasoning, tricky edge cases, and challenging problem-solving. The questions should be noticeably HARDER than the PYQs.`;
+    default:
+      return `Generate questions at the SAME DIFFICULTY LEVEL as the PYQs. Include a balanced mix of easy, medium, and hard questions matching the PYQ pattern.`;
+  }
+}
+
+function buildAIPrompt(questionType, paper, totalMarks, testDuration, pyqText, syllabusText, targetDifficulty = 'medium') {
   let typeInstructions = '';
   let formatInstructions = '';
 
@@ -741,7 +761,7 @@ PAPER / EXAM DETAILS:
 INSTRUCTIONS:
 1. Read through ALL the provided PYQ content carefully to understand the difficulty level and pattern.
 2. Read through the syllabus content to understand the topics to cover.
-3. Generate questions according to the syllabus content. The questions must be at the SAME DIFFICULTY LEVEL as the PYQs.
+3. ${getDifficultyInstructions(targetDifficulty)}
 4. Cover ALL major topics from the syllabus evenly.
 5. The total marks of ALL generated questions should closely match ${totalMarks} marks.
 6. ${typeInstructions}
@@ -1202,7 +1222,23 @@ app.post('/api/mock-tests/:id/start', authMiddleware, async (req, res) => {
       combinedPyqText = combinedPyqText.substring(0, MAX_CHARS) + '\n\n[Additional PYQ content truncated...]';
     }
 
-    const prompt = buildAIPrompt(qType, paper, totalMarks, testDuration, combinedPyqText, syllabusText);
+    // Fetch user's previous result for this paper to adjust difficulty
+    let targetDifficulty = 'medium';
+    try {
+      const previousResult = await MockTestResult.findOne({
+        userId: req.user.id,
+        paperId: req.params.id
+      }).sort({ completedAt: -1 });
+      if (previousResult && previousResult.totalMarks > 0) {
+        const percentage = (previousResult.score / previousResult.totalMarks) * 100;
+        targetDifficulty = getTargetDifficulty(percentage);
+        console.log(`[Adaptive Difficulty] User ${req.user.id} previous score: ${percentage.toFixed(1)}% → ${targetDifficulty}`);
+      }
+    } catch (err) {
+      console.error('Error fetching previous result for adaptive difficulty:', err.message);
+    }
+
+    const prompt = buildAIPrompt(qType, paper, totalMarks, testDuration, combinedPyqText, syllabusText, targetDifficulty);
 
     const aiResponse = await callAI(prompt);
     if (!aiResponse) {
@@ -1404,6 +1440,34 @@ app.get('/api/mock-tests/results', authMiddleware, async (req, res) => {
       .sort({ completedAt: -1 });
     res.json(results);
   } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// User: Get previous result for a specific paper (used for adaptive difficulty)
+app.get('/api/mock-tests/:id/previous-result', authMiddleware, async (req, res) => {
+  try {
+    const previousResult = await MockTestResult.findOne({
+      userId: req.user.id,
+      paperId: req.params.id
+    }).sort({ completedAt: -1 });
+    if (!previousResult) {
+      return res.json({ hasPreviousResult: false });
+    }
+    const percentage = previousResult.totalMarks > 0
+      ? ((previousResult.score / previousResult.totalMarks) * 100)
+      : 0;
+    const targetDifficulty = getTargetDifficulty(percentage);
+    res.json({
+      hasPreviousResult: true,
+      score: previousResult.score,
+      totalMarks: previousResult.totalMarks,
+      percentage: Number(percentage.toFixed(1)),
+      targetDifficulty,
+      completedAt: previousResult.completedAt
+    });
+  } catch (err) {
+    console.error('Previous result fetch error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
