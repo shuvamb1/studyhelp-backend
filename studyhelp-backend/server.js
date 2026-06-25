@@ -510,7 +510,7 @@ const MockQuestion = mongoose.model('MockQuestion', mockQuestionSchema);
 const mockTestResultSchema = new mongoose.Schema({
   userId: String, // can be MongoDB ObjectId (regular users) or 'admin_id' (admin)
   paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper' },
-  answers: [{ questionId: { type: mongoose.Schema.Types.Mixed }, selectedOption: Number, textAnswer: String }],
+  answers: [{ questionId: { type: mongoose.Schema.Types.Mixed }, selectedOption: Number, textAnswer: String, fileId: String, fileName: String }],
   score: Number,
   totalMarks: Number,
   correctCount: Number,
@@ -675,13 +675,13 @@ function getTargetDifficulty(percentage) {
 function getDifficultyInstructions(targetDifficulty) {
   switch (targetDifficulty) {
     case 'easy':
-      return `Generate EASY questions. Focus on fundamental concepts, direct recall, definitions, and basic application. The questions should be noticeably EASIER than the PYQs. Most questions should be straightforward with clear answers.`;
+      return `Generate EASY-level questions that still require genuine understanding. Focus on conceptual application, moderate reasoning, and standard problem-solving. Avoid trivial or one-liner questions. The questions should test whether the student truly understands the concepts, not just memorized them. Each question should require at least 2-3 logical steps to arrive at the answer.`;
     case 'medium-hard':
-      return `Generate questions that are SLIGHTLY HARDER than the PYQs. Include a mix of medium and hard questions, with emphasis on harder application-level problems, multi-step reasoning, and less common scenarios.`;
+      return `Generate HARDER questions that are noticeably MORE DIFFICULT than the PYQs. Focus on deep conceptual analysis, complex multi-step reasoning, edge cases, and advanced application. Include questions that require synthesis of multiple concepts, non-standard approaches, and careful thought. The questions should challenge even well-prepared students.`;
     case 'hard':
-      return `Generate HARD questions. Focus on advanced concepts, complex multi-step application, deep reasoning, tricky edge cases, and challenging problem-solving. The questions should be noticeably HARDER than the PYQs.`;
+      return `Generate EXPERT-LEVEL questions that are SIGNIFICANTLY HARDER than the PYQs. Focus on advanced theoretical concepts, novel problem-solving scenarios, complex derivations and proofs, interdisciplinary application, and deep reasoning. Questions should require extensive analysis, creative thinking, and mastery of the subject. These should challenge the top-performing students.`;
     default:
-      return `Generate questions at the SAME DIFFICULTY LEVEL as the PYQs. Include a balanced mix of easy, medium, and hard questions matching the PYQ pattern.`;
+      return `Generate MEDIUM-level questions that are MORE CHALLENGING than typical PYQs. Include a balanced mix of conceptual application, multi-step reasoning, and problem-solving questions. Avoid simple recall questions. Focus on questions that require understanding, analysis, and application of concepts in non-obvious ways.`;
   }
 }
 
@@ -1179,6 +1179,37 @@ app.post('/api/admin/mock-tests/:id/generate', authMiddleware, adminMiddleware, 
   }
 });
 
+// User: Upload a descriptive answer file (handwritten paper scanned as PDF or image)
+app.post('/api/mock-tests/:id/upload-answer', authMiddleware, upload.single('answerFile'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const allowedMimeTypes = ['application/pdf', 'image/png', 'image/jpeg', 'image/jpg'];
+    if (!allowedMimeTypes.includes(req.file.mimetype)) {
+      return res.status(400).json({ error: 'Only PDF, PNG, or JPG files are allowed' });
+    }
+    const maxSize = 5 * 1024 * 1024; // 5 MB
+    if (req.file.size > maxSize) {
+      return res.status(400).json({ error: 'File size exceeds 5 MB limit' });
+    }
+    const gridfsId = await uploadBufferToGridFS(req.file.buffer, req.file.originalname);
+    res.json({ success: true, fileId: gridfsId.toString(), fileName: req.file.originalname });
+  } catch (err) {
+    console.error('Upload answer error:', err);
+    res.status(500).json({ error: 'Failed to upload answer file' });
+  }
+});
+
+// User: Get an uploaded answer file
+app.get('/api/answer-files/:fileId', authMiddleware, async (req, res) => {
+  try {
+    const buffer = await downloadFromGridFS(req.params.fileId);
+    res.set('Content-Type', 'application/octet-stream');
+    res.send(buffer);
+  } catch (err) {
+    res.status(404).json({ error: 'File not found' });
+  }
+});
+
 // User: List available papers (any paper with at least one PDF)
 app.get('/api/mock-tests/papers', authMiddleware, async (req, res) => {
   try {
@@ -1348,17 +1379,22 @@ app.post('/api/mock-tests/:id/submit', authMiddleware, async (req, res) => {
     let score = 0, correct = 0, wrong = 0, unanswered = 0, descriptiveCount = 0;
     const answerMap = {};
     const textAnswerMap = {};
+    const fileAnswerMap = {};
     userAnswers.forEach(a => {
       answerMap[a.questionId] = a.selectedOption;
       if (a.textAnswer !== undefined && a.textAnswer !== null) {
         textAnswerMap[a.questionId] = a.textAnswer;
       }
+      if (a.fileId) {
+        fileAnswerMap[a.questionId] = { fileId: a.fileId, fileName: a.fileName || '' };
+      }
     });
 
     const detailedResults = questions.map((q, idx) => {
       if (q.type === 'descriptive') {
+        const fileAnswer = fileAnswerMap[idx];
         const textAnswer = textAnswerMap[idx] || '';
-        const isUnanswered = !textAnswer || textAnswer.trim() === '';
+        const isUnanswered = !fileAnswer && (!textAnswer || textAnswer.trim() === '');
         if (isUnanswered) unanswered++;
         else descriptiveCount++;
         return {
@@ -1369,6 +1405,8 @@ app.post('/api/mock-tests/:id/submit', authMiddleware, async (req, res) => {
           modelAnswer: q.modelAnswer || '',
           selectedOption: -1,
           textAnswer,
+          fileId: fileAnswer ? fileAnswer.fileId : null,
+          fileName: fileAnswer ? fileAnswer.fileName : null,
           isCorrect: null,
           marks: q.marks,
           type: 'descriptive'
@@ -1402,7 +1440,9 @@ app.post('/api/mock-tests/:id/submit', authMiddleware, async (req, res) => {
       answers: userAnswers.map(a => ({
         questionId: a.questionId,
         selectedOption: a.selectedOption,
-        textAnswer: a.textAnswer || ''
+        textAnswer: a.textAnswer || '',
+        fileId: a.fileId || '',
+        fileName: a.fileName || ''
       })),
       score,
       totalMarks: session.totalMarks,
