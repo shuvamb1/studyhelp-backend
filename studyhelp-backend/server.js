@@ -58,9 +58,28 @@ const AI_API_BASE = process.env.AI_API_BASE || 'https://api.openai.com/v1';
 const AI_MODEL = process.env.AI_MODEL || 'llama-3.3-70b-versatile';
 const aiEnabled = !!AI_API_KEY;
 
-// Competitive Mock Test AI config (separate API key)
-const AI_API_MOCK = process.env.AI_API_MOCK || process.env.AI_API_KEY || '';
-const aiMockEnabled = !!AI_API_MOCK;
+// Competitive Mock Test AI config — 10 rotating API keys for parallel generation
+const AI_API_MOCK_KEYS = [];
+for (let i = 1; i <= 10; i++) {
+  const key = process.env[`AI_API_MOCK${i}`];
+  if (key) AI_API_MOCK_KEYS.push(key);
+}
+// Fallback: if no numbered keys, use the single AI_API_MOCK or AI_API_KEY
+if (AI_API_MOCK_KEYS.length === 0) {
+  const fallback = process.env.AI_API_MOCK || process.env.AI_API_KEY || '';
+  if (fallback) AI_API_MOCK_KEYS.push(fallback);
+}
+const aiMockEnabled = AI_API_MOCK_KEYS.length > 0;
+
+let keyIndex = 0;
+function getNextMockKey() {
+  const key = AI_API_MOCK_KEYS[keyIndex % AI_API_MOCK_KEYS.length];
+  keyIndex++;
+  return key;
+}
+function getRandomMockKey() {
+  return AI_API_MOCK_KEYS[Math.floor(Math.random() * AI_API_MOCK_KEYS.length)];
+}
 
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('Connected to MongoDB Atlas'))
@@ -640,9 +659,9 @@ async function callAI(prompt) {
   }
 }
 
-// AI call for Competitive Mock Tests (uses AI_API_MOCK key)
-async function callAIMock(prompt, examName) {
-  if (!aiMockEnabled) return null;
+// AI call for Competitive Mock Tests (uses one of the rotating API keys)
+async function callAIMock(prompt, apiKey) {
+  if (!aiMockEnabled || !apiKey) return null;
   try {
     // Each batch is ~15-20 questions, so 6000 tokens is plenty
     const maxTokens = 6000;
@@ -650,7 +669,7 @@ async function callAIMock(prompt, examName) {
     const res = await fetch(`${AI_API_BASE}/chat/completions`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${AI_API_MOCK}`,
+        'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -947,27 +966,63 @@ function getExamBatchPlan(examName) {
 }
 
 function buildBatchPrompt(examName, batch, batchIndex, totalBatches, pyqText, syllabusText) {
-  return `Suppose you are a Question setter in the ${examName} examination. You are generating BATCH ${batchIndex + 1} of ${totalBatches} for a complete mock test paper.
+  // Exam-specific difficulty instructions
+  const difficultyInstructions = {
+    'GATE': `CRITICAL DIFFICULTY REQUIREMENT:
+- You are setting questions for the GATE (Graduate Aptitude Test in Engineering) — one of India's toughest engineering entrance exams.
+- The questions must be at the SAME difficulty level as actual GATE PYQs.
+- These are NOT simple textbook problems. They require deep conceptual understanding, multi-step problem solving, and application of formulas in non-obvious ways.
+- General Aptitude questions should be tricky — not straightforward word problems. Include tricky logical reasoning, pattern-based numerical ability, and subtle verbal questions.
+- Technical questions should involve: complex calculations, application of multiple concepts together, diagrams that require interpretation, and problems that test engineering depth.
+- Easy questions should still require some thought — not rote memorization.
+- 60% of questions should be HARD (2-mark level), 30% MEDIUM (1-mark level), 10% EASY.
+- Every question must have at least ONE plausible distractor (wrong option) that a well-prepared student might choose if they make a common mistake.`,
+
+    'NEET': `CRITICAL DIFFICULTY REQUIREMENT:
+- You are setting questions for NEET — India's medical entrance exam. Questions must match actual NEET difficulty.
+- Biology questions should test NCERT application, not just memorization. Include assertion-reason style thinking.
+- Physics questions should be numerical and conceptual. Chemistry should test mechanisms and reactions.
+- 40% HARD, 40% MEDIUM, 20% EASY. Each question is 4 marks.`,
+
+    'JEE': `CRITICAL DIFFICULTY REQUIREMENT:
+- You are setting questions for JEE Main / Advanced — one of the toughest engineering exams globally.
+- Physics and Chemistry must be deeply conceptual with multi-step problems.
+- Mathematics must involve clever substitutions, non-obvious approaches, and integration of multiple concepts.
+- 50% HARD, 35% MEDIUM, 15% EASY. Each question is 4 marks.`,
+
+    'WBJEE': `CRITICAL DIFFICULTY REQUIREMENT:
+- You are setting questions for WBJEE — a competitive state-level exam with tricky questions.
+- Mathematics questions often have subtle traps and require careful calculation.
+- Physics and Chemistry mix conceptual and numerical at moderate difficulty.
+- 35% HARD, 45% MEDIUM, 20% EASY.`
+  };
+
+  const diffText = difficultyInstructions[examName] || 'Generate questions at the actual exam difficulty level. 40% HARD, 40% MEDIUM, 20% EASY.';
+
+  return `You are an expert Question Setter for the ${examName} examination. You are generating BATCH ${batchIndex + 1} of ${totalBatches} for a complete mock test paper that mirrors the ACTUAL ${examName} exam pattern.
+
+${diffText}
 
 BATCH DETAILS:
 - Section: ${batch.name}
-- Questions to Generate in THIS batch: ${batch.count}
+- Questions to Generate in THIS batch: EXACTLY ${batch.count}
 - Target Marks for this batch: ${batch.marks}
 - Topics: ${batch.topics}
 - ${batch.instructions}
 
 EXAM RULES:
-- This is part of a ${examName} mock test. Each question MUST be an MCQ with exactly 4 options (A, B, C, D).
+- Each question MUST be a Multiple Choice Question with exactly 4 options (A, B, C, D).
 - Correct answer index: 0=A, 1=B, 2=C, 3=D.
-- Questions should be TOUGH and at the exact level of actual ${examName} examination.
-- Include a detailed modelAnswer (explanation) for each question.
-- Include difficulty (easy, medium, hard) and topic tag for each question.
-- Return ONLY a valid JSON array. NO markdown, NO code blocks, NO extra text.
+- At least one wrong option must be a PLAUSIBLE DISTRACTOR that tests common misconceptions.
+- Include a detailed modelAnswer with step-by-step reasoning for every question.
+- Include difficulty level (easy, medium, hard) and a specific topic tag for each question.
+- Return ONLY a valid JSON array. NO markdown, NO code blocks, NO extra text outside the JSON.
+- CRITICAL: You MUST generate EXACTLY ${batch.count} questions in this batch. Do not generate fewer.
 
-PREVIOUS YEAR QUESTION (PYQ) CONTENT:
+PREVIOUS YEAR QUESTION (PYQ) CONTENT (study these to understand the exact difficulty and pattern):
 ${pyqText || 'No PYQ content provided.'}
 
-SYLLABUS CONTENT:
+SYLLABUS CONTENT (cover these topics evenly):
 ${syllabusText || 'No syllabus provided.'}
 
 JSON FORMAT (return ONLY this array, no other text):
@@ -976,24 +1031,88 @@ JSON FORMAT (return ONLY this array, no other text):
     "question": "Question text here",
     "options": ["Option A", "Option B", "Option C", "Option D"],
     "correctAnswer": 0,
-    "modelAnswer": "Detailed explanation with step-by-step reasoning",
+    "modelAnswer": "Detailed step-by-step explanation of why this is correct",
     "marks": 1,
-    "difficulty": "medium",
-    "topic": "topic name",
+    "difficulty": "hard",
+    "topic": "specific topic name",
     "type": "mcq"
   }
 ]`;
 }
 
+// Parse AI response into validated questions
+function parseAIResponse(aiResponse, batch) {
+  if (!aiResponse) return { questions: [], error: 'No AI response' };
+
+  let cleanedResponse = aiResponse.trim();
+  if (cleanedResponse.startsWith('```json')) {
+    cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+  } else if (cleanedResponse.startsWith('```')) {
+    cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
+  }
+  cleanedResponse = cleanedResponse.trim();
+
+  let rawQuestions;
+  try {
+    rawQuestions = JSON.parse(cleanedResponse);
+  } catch (parseErr) {
+    return { questions: [], error: 'JSON parse error: ' + parseErr.message };
+  }
+
+  if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+    return { questions: [], error: 'Empty or invalid array' };
+  }
+
+  const questions = [];
+  for (const q of rawQuestions) {
+    if (!q.question) continue;
+    if (!Array.isArray(q.options) || q.options.length !== 4) continue;
+    if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+    questions.push({
+      question: q.question.trim(),
+      options: q.options.map(o => String(o).trim()),
+      correctAnswer: Math.round(q.correctAnswer),
+      modelAnswer: q.modelAnswer || '',
+      marks: Number(q.marks) || 1,
+      difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
+      topic: q.topic || batch.topics,
+      type: 'mcq'
+    });
+  }
+
+  return { questions, error: null };
+}
+
+async function generateBatchWithRetry(config, batch, batchIndex, totalBatches, pyqText, syllabusText, maxRetries = 2) {
+  const prompt = buildBatchPrompt(config.examName, batch, batchIndex, totalBatches, pyqText, syllabusText);
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const apiKey = getRandomMockKey();
+    console.log(`[Competitive Mock] Batch ${batchIndex + 1} attempt ${attempt + 1} (key ${Math.floor(Math.random() * AI_API_MOCK_KEYS.length) + 1}/${AI_API_MOCK_KEYS.length})`);
+
+    const aiResponse = await callAIMock(prompt, apiKey);
+    const result = parseAIResponse(aiResponse, batch);
+
+    if (result.questions.length > 0) {
+      console.log(`[Competitive Mock] Batch ${batchIndex + 1}: ${result.questions.length} valid questions`);
+      return { success: true, questions: result.questions };
+    }
+
+    console.error(`[Competitive Mock] Batch ${batchIndex + 1} attempt ${attempt + 1} failed: ${result.error}`);
+  }
+
+  return { success: false, error: `Failed after ${maxRetries + 1} attempts` };
+}
+
 async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration) {
   try {
     if (!aiMockEnabled) {
-      return { success: false, error: 'AI Mock API not configured. Please set AI_API_MOCK environment variable.' };
+      return { success: false, error: 'AI Mock API not configured. Please set at least one AI_API_MOCK1..10 environment variable.' };
     }
 
     const plan = getExamBatchPlan(config.examName);
     if (!plan) {
-      return { success: false, error: `Unknown exam: ${config.examName}. Supported exams: NEET, JEE, GATE, WBJEE.` };
+      return { success: false, error: `Unknown exam: ${config.examName}. Supported: NEET, JEE, GATE, WBJEE.` };
     }
 
     const pyqFiles = (config.pyqFiles || []).filter(f => f.gridfsId);
@@ -1002,7 +1121,6 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
     let pyqText = config.pyqText || '';
     let syllabusText = config.syllabusText || '';
 
-    // If texts not cached, extract from PDFs
     if (!pyqText && pyqFiles.length > 0) {
       const texts = await extractTextFromFileObjects(pyqFiles);
       pyqText = texts.join('\n\n---\n\n');
@@ -1016,7 +1134,7 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       return { success: false, error: 'No PYQ or syllabus content found for this exam.' };
     }
 
-    const MAX_CHARS = 6000;
+    const MAX_CHARS = 5000;
     let combinedPyqText = pyqText;
     if (combinedPyqText.length > MAX_CHARS) {
       combinedPyqText = combinedPyqText.substring(0, MAX_CHARS) + '\n\n[Additional PYQ content truncated...]';
@@ -1026,79 +1144,34 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       combinedSyllabusText = combinedSyllabusText.substring(0, MAX_CHARS) + '\n\n[Additional syllabus content truncated...]';
     }
 
-    // Generate each batch sequentially
+    console.log(`[Competitive Mock] Starting PARALLEL generation for ${config.examName} with ${AI_API_MOCK_KEYS.length} key(s). ${plan.batches.length} batches.`);
+    const startTime = Date.now();
+
+    // Run ALL batches in parallel using different API keys
+    const batchPromises = plan.batches.map((batch, i) =>
+      generateBatchWithRetry(config, batch, i, plan.batches.length, combinedPyqText, combinedSyllabusText, 2)
+    );
+
+    const batchResults = await Promise.all(batchPromises);
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Competitive Mock] Parallel generation completed in ${elapsed}s`);
+
+    // Collect all successful questions
     const allQuestions = [];
-    const totalBatches = plan.batches.length;
     let failedBatches = 0;
-
-    for (let i = 0; i < totalBatches; i++) {
-      const batch = plan.batches[i];
-      console.log(`[Competitive Mock] Generating batch ${i + 1}/${totalBatches}: ${batch.name} (${batch.count} questions)`);
-
-      const prompt = buildBatchPrompt(config.examName, batch, i, totalBatches, combinedPyqText, combinedSyllabusText);
-
-      const aiResponse = await callAIMock(prompt, config.examName);
-      if (!aiResponse) {
-        console.error(`[Competitive Mock] Batch ${i + 1} failed: no AI response`);
+    for (const result of batchResults) {
+      if (result.success && result.questions.length > 0) {
+        allQuestions.push(...result.questions);
+      } else {
         failedBatches++;
-        continue;
       }
-
-      // Clean up response
-      let cleanedResponse = aiResponse.trim();
-      if (cleanedResponse.startsWith('```json')) {
-        cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-      } else if (cleanedResponse.startsWith('```')) {
-        cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
-      }
-      cleanedResponse = cleanedResponse.trim();
-
-      let rawQuestions;
-      try {
-        rawQuestions = JSON.parse(cleanedResponse);
-      } catch (parseErr) {
-        console.error(`[Competitive Mock] Batch ${i + 1} JSON parse error:`, parseErr.message);
-        console.error('Raw response (first 300 chars):', cleanedResponse.substring(0, 300));
-        failedBatches++;
-        continue;
-      }
-
-      if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
-        console.error(`[Competitive Mock] Batch ${i + 1} generated no valid questions`);
-        failedBatches++;
-        continue;
-      }
-
-      // Validate and normalize each question
-      let batchValidCount = 0;
-      for (const q of rawQuestions) {
-        if (!q.question) continue;
-        if (!Array.isArray(q.options) || q.options.length !== 4) continue;
-        if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
-        allQuestions.push({
-          question: q.question.trim(),
-          options: q.options.map(o => String(o).trim()),
-          correctAnswer: Math.round(q.correctAnswer),
-          modelAnswer: q.modelAnswer || '',
-          marks: Number(q.marks) || 1,
-          difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
-          topic: q.topic || batch.topics,
-          type: 'mcq'
-        });
-        batchValidCount++;
-      }
-      console.log(`[Competitive Mock] Batch ${i + 1}: ${batchValidCount} valid questions added`);
     }
 
     if (allQuestions.length === 0) {
-      return { success: false, error: 'No valid questions generated from any batch. Please check AI_API_MOCK configuration and try again.' };
+      return { success: false, error: 'All batches failed. No questions generated. Please check AI_API_MOCK keys and try again.' };
     }
 
-    if (failedBatches > 0) {
-      console.warn(`[Competitive Mock] ${failedBatches} of ${totalBatches} batches failed. Generated ${allQuestions.length} of ${plan.totalQuestions} target questions.`);
-    } else {
-      console.log(`[Competitive Mock] All batches successful. Generated ${allQuestions.length} questions.`);
-    }
+    console.log(`[Competitive Mock] ${plan.batches.length - failedBatches}/${plan.batches.length} batches succeeded. Generated ${allQuestions.length} questions (target: ${plan.totalQuestions}).`);
 
     return { success: true, questions: allQuestions };
   } catch (err) {
@@ -1993,11 +2066,12 @@ app.delete('/api/admin/competitive-exams/:examName', authMiddleware, adminMiddle
 app.get('/api/admin/ai-mock-status', authMiddleware, adminMiddleware, (req, res) => {
   res.json({
     aiMockEnabled,
+    apiKeyCount: AI_API_MOCK_KEYS.length,
     apiBase: AI_API_BASE,
     model: AI_MODEL,
     message: aiMockEnabled
-      ? 'AI Mock API is configured. Ready to generate competitive exam questions.'
-      : 'AI_API_MOCK not configured. Falling back to AI_API_KEY if available.'
+      ? `AI Mock API is configured with ${AI_API_MOCK_KEYS.length} key(s). Ready to generate competitive exam questions in parallel.`
+      : 'No AI_API_MOCK1..10 keys configured. Set at least one AI_API_MOCK{N} environment variable.'
   });
 });
 
