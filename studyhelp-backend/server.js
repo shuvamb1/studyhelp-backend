@@ -58,6 +58,10 @@ const AI_API_BASE = process.env.AI_API_BASE || 'https://api.openai.com/v1';
 const AI_MODEL = process.env.AI_MODEL || 'llama-3.3-70b-versatile';
 const aiEnabled = !!AI_API_KEY;
 
+// Competitive Mock Test AI config (separate API key)
+const AI_API_MOCK = process.env.AI_API_MOCK || process.env.AI_API_KEY || '';
+const aiMockEnabled = !!AI_API_MOCK;
+
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('Connected to MongoDB Atlas'))
   .catch((err) => {
@@ -542,6 +546,66 @@ const testSessionSchema = new mongoose.Schema({
 });
 const TestSession = mongoose.model('TestSession', testSessionSchema);
 
+// ========== COMPETITIVE EXAM MOCK TEST SCHEMAS ==========
+
+const competitiveExamConfigSchema = new mongoose.Schema({
+  examName: { type: String, enum: ['NEET', 'JEE', 'GATE', 'WBJEE'], required: true, unique: true },
+  displayName: String,
+  syllabusFiles: [{
+    gridfsId: { type: mongoose.Schema.Types.ObjectId, index: true },
+    filename: String,
+    originalName: String,
+    uploadedAt: { type: Date, default: Date.now }
+  }],
+  pyqFiles: [{
+    gridfsId: { type: mongoose.Schema.Types.ObjectId, index: true },
+    filename: String,
+    originalName: String,
+    uploadedAt: { type: Date, default: Date.now }
+  }],
+  syllabusText: String,
+  pyqText: String,
+  duration: { type: Number, default: 180 },
+  totalMarks: { type: Number, default: 300 },
+  status: { type: String, default: 'active' },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+const CompetitiveExamConfig = mongoose.model('CompetitiveExamConfig', competitiveExamConfigSchema);
+
+const competitiveTestSessionSchema = new mongoose.Schema({
+  examName: { type: String, enum: ['NEET', 'JEE', 'GATE', 'WBJEE'], required: true },
+  userId: String,
+  questions: [{
+    question: String,
+    options: [String],
+    correctAnswer: Number,
+    modelAnswer: String,
+    marks: Number,
+    difficulty: String,
+    topic: String,
+    type: { type: String, enum: ['mcq', 'descriptive'], default: 'mcq' }
+  }],
+  totalMarks: Number,
+  duration: Number,
+  createdAt: { type: Date, default: Date.now, expires: 7200 }
+});
+const CompetitiveTestSession = mongoose.model('CompetitiveTestSession', competitiveTestSessionSchema);
+
+const competitiveTestResultSchema = new mongoose.Schema({
+  userId: String,
+  examName: String,
+  answers: [{ questionId: { type: mongoose.Schema.Types.Mixed }, selectedOption: Number, textAnswer: String, fileId: String, fileName: String }],
+  score: Number,
+  totalMarks: Number,
+  correctCount: Number,
+  wrongCount: Number,
+  unansweredCount: Number,
+  timeTaken: Number,
+  completedAt: { type: Date, default: Date.now }
+});
+const CompetitiveTestResult = mongoose.model('CompetitiveTestResult', competitiveTestResultSchema);
+
 // ========== AI QUESTION GENERATION HELPERS ==========
 
 async function callAI(prompt) {
@@ -572,6 +636,39 @@ async function callAI(prompt) {
     return data.choices?.[0]?.message?.content || null;
   } catch (err) {
     console.error('AI call failed:', err);
+    return null;
+  }
+}
+
+// AI call for Competitive Mock Tests (uses AI_API_MOCK key)
+async function callAIMock(prompt) {
+  if (!aiMockEnabled) return null;
+  try {
+    const res = await fetch(`${AI_API_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AI_API_MOCK}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: AI_MODEL,
+        messages: [
+          { role: 'system', content: 'You are an expert competitive exam question setter. You generate tough, exam-level questions for competitive examinations (NEET, JEE, GATE, WBJEE). You always respond with valid JSON only, no markdown, no explanations, no code blocks.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.7,
+        max_tokens: 4000
+      })
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error('AI Mock API error:', errText);
+      return null;
+    }
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (err) {
+    console.error('AI Mock call failed:', err);
     return null;
   }
 }
@@ -778,6 +875,138 @@ JSON FORMAT (return ONLY this array, no other text):
 ${formatInstructions}`;
 
   return prompt;
+}
+
+// ========== COMPETITIVE EXAM AI PROMPT & GENERATION ==========
+
+function buildCompetitiveAIPrompt(examName, totalMarks, duration, pyqText, syllabusText) {
+  const prompt = `Suppose you are a Question setter in the ${examName} examination. Generate a tough ${examName} question paper according to the syllabus and the PYQ of the last 5 years.
+
+EXAM DETAILS:
+- Exam: ${examName}
+- Total Marks: ${totalMarks}
+- Duration: ${duration} minutes
+- Generate ONLY Multiple Choice Questions (MCQ). Each question must have exactly 4 options (A, B, C, D). Mark the correct answer with a 0-based index (0=A, 1=B, 2=C, 3=D).
+- The questions should be TOUGH and at the level of actual ${examName} examination.
+- Cover ALL major topics from the syllabus evenly.
+- The total marks of ALL generated questions should closely match ${totalMarks} marks.
+- Include difficulty level (easy, medium, hard) and a topic tag for each question.
+- Return ONLY a valid JSON array with NO markdown formatting, NO code blocks, NO explanation text outside the JSON.
+
+PREVIOUS YEAR QUESTION (PYQ) CONTENT (last 5 years):
+${pyqText || 'No PYQ content provided.'}
+
+SYLLABUS CONTENT:
+${syllabusText || 'No syllabus provided. Generate based on exam pattern.'}
+
+JSON FORMAT (return ONLY this array, no other text):
+[
+  {
+    "question": "Question text here",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correctAnswer": 0,
+    "modelAnswer": "Detailed explanation of the correct answer",
+    "marks": 4,
+    "difficulty": "hard",
+    "topic": "topic name",
+    "type": "mcq"
+  }
+]`;
+  return prompt;
+}
+
+async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration) {
+  try {
+    if (!aiMockEnabled) {
+      return { success: false, error: 'AI Mock API not configured. Please set AI_API_MOCK environment variable.' };
+    }
+
+    const pyqFiles = (config.pyqFiles || []).filter(f => f.gridfsId);
+    const syllabusFiles = (config.syllabusFiles || []).filter(f => f.gridfsId);
+
+    let pyqText = config.pyqText || '';
+    let syllabusText = config.syllabusText || '';
+
+    // If texts not cached, extract from PDFs
+    if (!pyqText && pyqFiles.length > 0) {
+      const texts = await extractTextFromFileObjects(pyqFiles);
+      pyqText = texts.join('\n\n---\n\n');
+    }
+    if (!syllabusText && syllabusFiles.length > 0) {
+      const texts = await extractTextFromFileObjects(syllabusFiles);
+      syllabusText = texts.join('\n\n---\n\n');
+    }
+
+    if (!pyqText && !syllabusText) {
+      return { success: false, error: 'No PYQ or syllabus content found for this exam.' };
+    }
+
+    const MAX_CHARS = 12000;
+    let combinedPyqText = pyqText;
+    if (combinedPyqText.length > MAX_CHARS) {
+      combinedPyqText = combinedPyqText.substring(0, MAX_CHARS) + '\n\n[Additional PYQ content truncated...]';
+    }
+    let combinedSyllabusText = syllabusText;
+    if (combinedSyllabusText.length > MAX_CHARS) {
+      combinedSyllabusText = combinedSyllabusText.substring(0, MAX_CHARS) + '\n\n[Additional syllabus content truncated...]';
+    }
+
+    const prompt = buildCompetitiveAIPrompt(config.examName, totalMarks, duration, combinedPyqText, combinedSyllabusText);
+
+    const aiResponse = await callAIMock(prompt);
+    if (!aiResponse) {
+      return { success: false, error: 'AI generation failed. Please check your AI_API_MOCK configuration.' };
+    }
+
+    // Clean up response
+    let cleanedResponse = aiResponse.trim();
+    if (cleanedResponse.startsWith('```json')) {
+      cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+    } else if (cleanedResponse.startsWith('```')) {
+      cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
+    }
+    cleanedResponse = cleanedResponse.trim();
+
+    let rawQuestions;
+    try {
+      rawQuestions = JSON.parse(cleanedResponse);
+    } catch (parseErr) {
+      console.error('AI Mock JSON parse error:', parseErr.message);
+      console.error('Raw response (first 500 chars):', cleanedResponse.substring(0, 500));
+      return { success: false, error: 'AI returned invalid JSON format. The AI response could not be parsed into questions.' };
+    }
+
+    if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+      return { success: false, error: 'AI generated no valid questions.' };
+    }
+
+    // Validate and normalize each question
+    const questions = [];
+    for (const q of rawQuestions) {
+      if (!q.question) continue;
+      if (!Array.isArray(q.options) || q.options.length !== 4) continue;
+      if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+      questions.push({
+        question: q.question.trim(),
+        options: q.options.map(o => String(o).trim()),
+        correctAnswer: Math.round(q.correctAnswer),
+        modelAnswer: q.modelAnswer || '',
+        marks: Number(q.marks) || 4,
+        difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
+        topic: q.topic || '',
+        type: 'mcq'
+      });
+    }
+
+    if (questions.length === 0) {
+      return { success: false, error: 'No valid questions after validation. The AI response did not contain properly formatted questions.' };
+    }
+
+    return { success: true, questions };
+  } catch (err) {
+    console.error('generateCompetitiveQuestionsFromExam error:', err);
+    return { success: false, error: err.message };
+  }
 }
 
 // Generate questions from ALL PDFs of a paper using AI
@@ -1508,6 +1737,343 @@ app.get('/api/mock-tests/:id/previous-result', authMiddleware, async (req, res) 
     });
   } catch (err) {
     console.error('Previous result fetch error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ========== COMPETITIVE EXAM MOCK TEST ROUTES ==========
+
+// Admin: Get all competitive exam configs
+app.get('/api/admin/competitive-exams', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const configs = await CompetitiveExamConfig.find().sort({ examName: 1 }).select('-__v');
+    res.json(configs);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin: Create or update a competitive exam config
+app.post('/api/admin/competitive-exams', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { examName, displayName, duration, totalMarks } = req.body;
+    if (!['NEET', 'JEE', 'GATE', 'WBJEE'].includes(examName)) {
+      return res.status(400).json({ error: 'Invalid exam name. Must be NEET, JEE, GATE, or WBJEE.' });
+    }
+    let config = await CompetitiveExamConfig.findOne({ examName });
+    if (config) {
+      config.displayName = displayName || config.displayName;
+      config.duration = duration || config.duration;
+      config.totalMarks = totalMarks || config.totalMarks;
+      config.updatedAt = new Date();
+    } else {
+      config = new CompetitiveExamConfig({
+        examName,
+        displayName: displayName || examName,
+        duration: duration || 180,
+        totalMarks: totalMarks || 300
+      });
+    }
+    await config.save();
+    res.json({ success: true, config });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin: Upload PYQ PDFs for a competitive exam
+app.post('/api/admin/competitive-exams/:examName/pyq', authMiddleware, adminMiddleware, upload.array('pyq', 10), async (req, res) => {
+  try {
+    const { examName } = req.params;
+    if (!['NEET', 'JEE', 'GATE', 'WBJEE'].includes(examName)) {
+      return res.status(400).json({ error: 'Invalid exam name' });
+    }
+    const config = await CompetitiveExamConfig.findOne({ examName });
+    if (!config) return res.status(404).json({ error: 'Exam config not found. Create it first.' });
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No PDF files uploaded' });
+    }
+
+    const newFiles = [];
+    const buffers = [];
+    for (const file of req.files) {
+      const gridfsId = await uploadBufferToGridFS(file.buffer, file.originalname);
+      newFiles.push({ gridfsId, filename: file.originalname, originalName: file.originalname, uploadedAt: new Date() });
+      buffers.push(file.buffer);
+    }
+    config.pyqFiles = config.pyqFiles || [];
+    config.pyqFiles.push(...newFiles);
+
+    // Extract and cache text
+    const texts = await extractTextFromBuffers(buffers);
+    if (texts.length > 0) {
+      const existingText = config.pyqText || '';
+      const newText = texts.join('\n\n---\n\n');
+      config.pyqText = existingText ? existingText + '\n\n---\n\n' + newText : newText;
+    }
+    config.updatedAt = new Date();
+    await config.save();
+
+    res.json({ message: `${req.files.length} PYQ PDF(s) uploaded successfully.`, pyqCount: config.pyqFiles.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to upload PYQ PDFs' });
+  }
+});
+
+// Admin: Upload Syllabus PDFs for a competitive exam
+app.post('/api/admin/competitive-exams/:examName/syllabus', authMiddleware, adminMiddleware, upload.array('syllabus', 5), async (req, res) => {
+  try {
+    const { examName } = req.params;
+    if (!['NEET', 'JEE', 'GATE', 'WBJEE'].includes(examName)) {
+      return res.status(400).json({ error: 'Invalid exam name' });
+    }
+    const config = await CompetitiveExamConfig.findOne({ examName });
+    if (!config) return res.status(404).json({ error: 'Exam config not found. Create it first.' });
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No syllabus PDF files uploaded' });
+    }
+
+    const newFiles = [];
+    const buffers = [];
+    for (const file of req.files) {
+      const gridfsId = await uploadBufferToGridFS(file.buffer, file.originalname);
+      newFiles.push({ gridfsId, filename: file.originalname, originalName: file.originalname, uploadedAt: new Date() });
+      buffers.push(file.buffer);
+    }
+    config.syllabusFiles = config.syllabusFiles || [];
+    config.syllabusFiles.push(...newFiles);
+
+    // Extract and cache text
+    const texts = await extractTextFromBuffers(buffers);
+    if (texts.length > 0) {
+      const existingText = config.syllabusText || '';
+      const newText = texts.join('\n\n---\n\n');
+      config.syllabusText = existingText ? existingText + '\n\n---\n\n' + newText : newText;
+    }
+    config.updatedAt = new Date();
+    await config.save();
+
+    res.json({ message: `${req.files.length} syllabus PDF(s) uploaded successfully.`, syllabusCount: config.syllabusFiles.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to upload syllabus PDFs' });
+  }
+});
+
+// Admin: Delete a competitive exam config (and its files)
+app.delete('/api/admin/competitive-exams/:examName', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { examName } = req.params;
+    const config = await CompetitiveExamConfig.findOne({ examName });
+    if (!config) return res.status(404).json({ error: 'Exam config not found' });
+
+    // Delete associated GridFS files
+    if (config.pyqFiles) {
+      for (const f of config.pyqFiles) {
+        if (f.gridfsId) try { await deleteFromGridFS(f.gridfsId); } catch (e) { /* ignore */ }
+      }
+    }
+    if (config.syllabusFiles) {
+      for (const f of config.syllabusFiles) {
+        if (f.gridfsId) try { await deleteFromGridFS(f.gridfsId); } catch (e) { /* ignore */ }
+      }
+    }
+
+    await CompetitiveTestResult.deleteMany({ examName });
+    await CompetitiveExamConfig.deleteOne({ examName });
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin: Check AI Mock configuration status
+app.get('/api/admin/ai-mock-status', authMiddleware, adminMiddleware, (req, res) => {
+  res.json({
+    aiMockEnabled,
+    apiBase: AI_API_BASE,
+    model: AI_MODEL,
+    message: aiMockEnabled
+      ? 'AI Mock API is configured. Ready to generate competitive exam questions.'
+      : 'AI_API_MOCK not configured. Falling back to AI_API_KEY if available.'
+  });
+});
+
+// User: List available competitive exams (only those with PYQ or syllabus)
+app.get('/api/competitive-exams', authMiddleware, async (req, res) => {
+  try {
+    const configs = await CompetitiveExamConfig.find({ status: 'active' }).select('-__v');
+    const available = configs.filter(c => {
+      const hasPyq = (c.pyqFiles && c.pyqFiles.length > 0) || c.pyqText;
+      const hasSyllabus = (c.syllabusFiles && c.syllabusFiles.length > 0) || c.syllabusText;
+      return hasPyq || hasSyllabus;
+    });
+    res.json(available);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// User: Start a competitive mock test
+app.post('/api/competitive-exams/:examName/start', authMiddleware, async (req, res) => {
+  try {
+    const { examName } = req.params;
+    if (!['NEET', 'JEE', 'GATE', 'WBJEE'].includes(examName)) {
+      return res.status(400).json({ error: 'Invalid exam name' });
+    }
+    const config = await CompetitiveExamConfig.findOne({ examName, status: 'active' });
+    if (!config) return res.status(404).json({ error: 'Exam not found or not active' });
+
+    const { marks, duration } = req.body;
+    const totalMarks = Number(marks) || config.totalMarks || 300;
+    const testDuration = Number(duration) || config.duration || 180;
+
+    if (!aiMockEnabled) {
+      return res.status(400).json({ error: 'AI Mock is not configured on this server. Please contact admin.' });
+    }
+
+    const result = await generateCompetitiveQuestionsFromExam(config, totalMarks, testDuration);
+    if (!result.success) {
+      return res.status(500).json({ error: result.error || 'Question generation failed' });
+    }
+
+    const questions = result.questions;
+    let actualTotalMarks = 0;
+    for (const q of questions) actualTotalMarks += q.marks;
+
+    // Create ephemeral session
+    const session = new CompetitiveTestSession({
+      examName,
+      userId: req.user.id,
+      questions,
+      totalMarks: actualTotalMarks,
+      duration: testDuration
+    });
+    await session.save();
+
+    // Return questions without correct answers
+    const clientQuestions = questions.map((q, idx) => ({
+      id: idx,
+      question: q.question,
+      options: q.options,
+      marks: q.marks,
+      difficulty: q.difficulty,
+      topic: q.topic,
+      type: q.type
+    }));
+
+    res.json({
+      testId: session._id,
+      examName: config.displayName || examName,
+      questions: clientQuestions,
+      totalMarks: actualTotalMarks,
+      duration: testDuration,
+      questionCount: questions.length
+    });
+  } catch (err) {
+    console.error('Start competitive test error:', err);
+    res.status(500).json({ error: 'Server error during test generation' });
+  }
+});
+
+// User: Submit competitive test
+app.post('/api/competitive-exams/:examName/submit', authMiddleware, async (req, res) => {
+  try {
+    const { testId, answers, timeTaken } = req.body;
+    if (!testId) return res.status(400).json({ error: 'Test ID required' });
+
+    const session = await CompetitiveTestSession.findById(testId);
+    if (!session) return res.status(400).json({ error: 'Test session expired or not found. Please start a new test.' });
+
+    const questions = session.questions;
+    const userAnswers = answers || [];
+
+    let score = 0, correct = 0, wrong = 0, unanswered = 0;
+    const answerMap = {};
+    userAnswers.forEach(a => { answerMap[a.questionId] = a.selectedOption; });
+
+    const detailedResults = questions.map((q, idx) => {
+      const selected = answerMap[idx];
+      const isCorrect = selected === q.correctAnswer;
+      const isUnanswered = selected === undefined || selected === null;
+
+      if (isCorrect) { score += q.marks; correct++; }
+      else if (isUnanswered) { unanswered++; }
+      else { wrong++; }
+
+      return {
+        questionId: idx,
+        question: q.question,
+        options: q.options,
+        correctAnswer: q.correctAnswer,
+        modelAnswer: q.modelAnswer || '',
+        selectedOption: selected,
+        isCorrect,
+        marks: q.marks,
+        type: 'mcq'
+      };
+    });
+
+    const result = new CompetitiveTestResult({
+      userId: req.user.id,
+      examName: session.examName,
+      answers: userAnswers.map(a => ({
+        questionId: a.questionId,
+        selectedOption: a.selectedOption
+      })),
+      score,
+      totalMarks: session.totalMarks,
+      correctCount: correct,
+      wrongCount: wrong,
+      unansweredCount: unanswered,
+      timeTaken: timeTaken || 0
+    });
+    await result.save();
+
+    // Clean up session
+    await CompetitiveTestSession.findByIdAndDelete(testId);
+
+    res.json({
+      score,
+      totalMarks: session.totalMarks,
+      correctCount: correct,
+      wrongCount: wrong,
+      unansweredCount: unanswered,
+      timeTaken: timeTaken || 0,
+      percentage: session.totalMarks > 0 ? ((score / session.totalMarks) * 100).toFixed(2) : '0.00',
+      detailedResults
+    });
+  } catch (err) {
+    console.error('Submit competitive test error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// User: Get competitive test results
+app.get('/api/competitive-exams/results', authMiddleware, async (req, res) => {
+  try {
+    const results = await CompetitiveTestResult.find({ userId: req.user.id })
+      .sort({ completedAt: -1 });
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// User: Get competitive results for a specific exam
+app.get('/api/competitive-exams/:examName/results', authMiddleware, async (req, res) => {
+  try {
+    const results = await CompetitiveTestResult.find({
+      userId: req.user.id,
+      examName: req.params.examName
+    }).sort({ completedAt: -1 });
+    res.json(results);
+  } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
