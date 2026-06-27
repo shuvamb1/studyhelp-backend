@@ -641,9 +641,12 @@ async function callAI(prompt) {
 }
 
 // AI call for Competitive Mock Tests (uses AI_API_MOCK key)
-async function callAIMock(prompt) {
+async function callAIMock(prompt, examName) {
   if (!aiMockEnabled) return null;
   try {
+    // Each batch is ~15-20 questions, so 6000 tokens is plenty
+    const maxTokens = 6000;
+
     const res = await fetch(`${AI_API_BASE}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -653,11 +656,11 @@ async function callAIMock(prompt) {
       body: JSON.stringify({
         model: AI_MODEL,
         messages: [
-          { role: 'system', content: 'You are an expert competitive exam question setter. You generate tough, exam-level questions for competitive examinations (NEET, JEE, GATE, WBJEE). You always respond with valid JSON only, no markdown, no explanations, no code blocks.' },
+          { role: 'system', content: 'You are an expert competitive exam question setter. You generate tough, exam-level questions for competitive examinations (NEET, JEE, GATE, WBJEE). You always respond with valid JSON only, no markdown, no explanations, no code blocks. You must generate the exact number of questions requested in the prompt.' },
           { role: 'user', content: prompt }
         ],
         temperature: 0.7,
-        max_tokens: 4000
+        max_tokens: maxTokens
       })
     });
     if (!res.ok) {
@@ -879,25 +882,93 @@ ${formatInstructions}`;
 
 // ========== COMPETITIVE EXAM AI PROMPT & GENERATION ==========
 
-function buildCompetitiveAIPrompt(examName, totalMarks, duration, pyqText, syllabusText) {
-  const prompt = `Suppose you are a Question setter in the ${examName} examination. Generate a tough ${examName} question paper according to the syllabus and the PYQ of the last 5 years.
+// Exam batch plans — how to split each exam into manageable AI batches
+function getExamBatchPlan(examName) {
+  const plans = {
+    'GATE': {
+      totalQuestions: 65,
+      totalMarks: 100,
+      duration: 180,
+      batches: [
+        { name: 'General Aptitude', count: 10, marks: 15, topics: 'Verbal Ability, Numerical Ability, Logical Reasoning', instructions: 'Generate 10 General Aptitude questions. First 5 questions should be 1-mark each. Next 5 questions should be 2-marks each. Total: 15 marks. These are NON-technical questions testing verbal ability, numerical ability, and logical reasoning.' },
+        { name: 'Technical Part A', count: 20, marks: 30, topics: 'Subject-specific technical topics from syllabus', instructions: 'Generate 20 technical subject questions. Mix of 1-mark and 2-mark questions. About 12 questions of 1-mark and 8 questions of 2-mark. Total: ~30 marks. Cover the first half of the syllabus topics evenly.' },
+        { name: 'Technical Part B', count: 20, marks: 30, topics: 'Subject-specific technical topics from syllabus', instructions: 'Generate 20 technical subject questions. Mix of 1-mark and 2-mark questions. About 12 questions of 1-mark and 8 questions of 2-mark. Total: ~30 marks. Cover the remaining half of the syllabus topics evenly.' },
+        { name: 'Technical Part C', count: 15, marks: 25, topics: 'Subject-specific technical topics from syllabus', instructions: 'Generate 15 technical subject questions. Mix of 1-mark and 2-mark questions. About 8 questions of 1-mark and 7 questions of 2-mark. Total: ~25 marks. Cover any remaining syllabus topics.' }
+      ]
+    },
+    'NEET': {
+      totalQuestions: 180,
+      totalMarks: 720,
+      duration: 180,
+      batches: [
+        { name: 'Physics Part A', count: 15, marks: 60, topics: 'Physics', instructions: 'Generate 15 Physics questions. Each question is 4 marks (standard NEET pattern). Total: 60 marks. Cover fundamental physics topics evenly.' },
+        { name: 'Physics Part B', count: 15, marks: 60, topics: 'Physics', instructions: 'Generate 15 Physics questions. Each question is 4 marks. Total: 60 marks. Cover remaining physics topics.' },
+        { name: 'Physics Part C', count: 15, marks: 60, topics: 'Physics', instructions: 'Generate 15 Physics questions. Each question is 4 marks. Total: 60 marks. Cover advanced physics topics.' },
+        { name: 'Chemistry Part A', count: 15, marks: 60, topics: 'Chemistry', instructions: 'Generate 15 Chemistry questions. Each question is 4 marks. Total: 60 marks. Cover physical chemistry topics.' },
+        { name: 'Chemistry Part B', count: 15, marks: 60, topics: 'Chemistry', instructions: 'Generate 15 Chemistry questions. Each question is 4 marks. Total: 60 marks. Cover organic and inorganic chemistry topics.' },
+        { name: 'Chemistry Part C', count: 15, marks: 60, topics: 'Chemistry', instructions: 'Generate 15 Chemistry questions. Each question is 4 marks. Total: 60 marks. Cover remaining chemistry topics.' },
+        { name: 'Biology Part A', count: 20, marks: 80, topics: 'Biology', instructions: 'Generate 20 Biology questions (Botany + Zoology). Each question is 4 marks. Total: 80 marks.' },
+        { name: 'Biology Part B', count: 20, marks: 80, topics: 'Biology', instructions: 'Generate 20 Biology questions (Botany + Zoology). Each question is 4 marks. Total: 80 marks.' },
+        { name: 'Biology Part C', count: 20, marks: 80, topics: 'Biology', instructions: 'Generate 20 Biology questions (Botany + Zoology). Each question is 4 marks. Total: 80 marks.' },
+        { name: 'Biology Part D', count: 20, marks: 80, topics: 'Biology', instructions: 'Generate 20 Biology questions (Botany + Zoology). Each question is 4 marks. Total: 80 marks.' },
+        { name: 'Biology Part E', count: 20, marks: 80, topics: 'Biology', instructions: 'Generate 20 Biology questions (Botany + Zoology). Each question is 4 marks. Total: 80 marks.' }
+      ]
+    },
+    'JEE': {
+      totalQuestions: 90,
+      totalMarks: 360,
+      duration: 180,
+      batches: [
+        { name: 'Physics Part A', count: 15, marks: 60, topics: 'Physics', instructions: 'Generate 15 Physics questions. Each question is 4 marks. Total: 60 marks. Cover mechanics and basic physics topics.' },
+        { name: 'Physics Part B', count: 15, marks: 60, topics: 'Physics', instructions: 'Generate 15 Physics questions. Each question is 4 marks. Total: 60 marks. Cover electromagnetism and modern physics topics.' },
+        { name: 'Chemistry Part A', count: 15, marks: 60, topics: 'Chemistry', instructions: 'Generate 15 Chemistry questions. Each question is 4 marks. Total: 60 marks. Cover physical chemistry topics.' },
+        { name: 'Chemistry Part B', count: 15, marks: 60, topics: 'Chemistry', instructions: 'Generate 15 Chemistry questions. Each question is 4 marks. Total: 60 marks. Cover organic and inorganic chemistry topics.' },
+        { name: 'Mathematics Part A', count: 15, marks: 60, topics: 'Mathematics', instructions: 'Generate 15 Mathematics questions. Each question is 4 marks. Total: 60 marks. Cover algebra and calculus topics.' },
+        { name: 'Mathematics Part B', count: 15, marks: 60, topics: 'Mathematics', instructions: 'Generate 15 Mathematics questions. Each question is 4 marks. Total: 60 marks. Cover geometry, trigonometry, and advanced topics.' }
+      ]
+    },
+    'WBJEE': {
+      totalQuestions: 155,
+      totalMarks: 200,
+      duration: 120,
+      batches: [
+        { name: 'Mathematics Part A', count: 20, marks: 25, topics: 'Mathematics', instructions: 'Generate 20 Mathematics questions. Mix of 1-mark and 2-mark questions. Total: ~25 marks.' },
+        { name: 'Mathematics Part B', count: 20, marks: 25, topics: 'Mathematics', instructions: 'Generate 20 Mathematics questions. Mix of 1-mark and 2-mark questions. Total: ~25 marks.' },
+        { name: 'Mathematics Part C', count: 18, marks: 25, topics: 'Mathematics', instructions: 'Generate 18 Mathematics questions. Mix of 1-mark and 2-mark questions. Total: ~25 marks.' },
+        { name: 'Physics Part A', count: 15, marks: 20, topics: 'Physics', instructions: 'Generate 15 Physics questions. Mix of 1-mark and 2-mark questions. Total: ~20 marks.' },
+        { name: 'Physics Part B', count: 15, marks: 20, topics: 'Physics', instructions: 'Generate 15 Physics questions. Mix of 1-mark and 2-mark questions. Total: ~20 marks.' },
+        { name: 'Physics Part C', count: 12, marks: 15, topics: 'Physics', instructions: 'Generate 12 Physics questions. Mix of 1-mark and 2-mark questions. Total: ~15 marks.' },
+        { name: 'Chemistry Part A', count: 15, marks: 20, topics: 'Chemistry', instructions: 'Generate 15 Chemistry questions. Mix of 1-mark and 2-mark questions. Total: ~20 marks.' },
+        { name: 'Chemistry Part B', count: 12, marks: 15, topics: 'Chemistry', instructions: 'Generate 12 Chemistry questions. Mix of 1-mark and 2-mark questions. Total: ~15 marks.' }
+      ]
+    }
+  };
+  return plans[examName] || null;
+}
 
-EXAM DETAILS:
-- Exam: ${examName}
-- Total Marks: ${totalMarks}
-- Duration: ${duration} minutes
-- Generate ONLY Multiple Choice Questions (MCQ). Each question must have exactly 4 options (A, B, C, D). Mark the correct answer with a 0-based index (0=A, 1=B, 2=C, 3=D).
-- The questions should be TOUGH and at the level of actual ${examName} examination.
-- Cover ALL major topics from the syllabus evenly.
-- The total marks of ALL generated questions should closely match ${totalMarks} marks.
-- Include difficulty level (easy, medium, hard) and a topic tag for each question.
-- Return ONLY a valid JSON array with NO markdown formatting, NO code blocks, NO explanation text outside the JSON.
+function buildBatchPrompt(examName, batch, batchIndex, totalBatches, pyqText, syllabusText) {
+  return `Suppose you are a Question setter in the ${examName} examination. You are generating BATCH ${batchIndex + 1} of ${totalBatches} for a complete mock test paper.
 
-PREVIOUS YEAR QUESTION (PYQ) CONTENT (last 5 years):
+BATCH DETAILS:
+- Section: ${batch.name}
+- Questions to Generate in THIS batch: ${batch.count}
+- Target Marks for this batch: ${batch.marks}
+- Topics: ${batch.topics}
+- ${batch.instructions}
+
+EXAM RULES:
+- This is part of a ${examName} mock test. Each question MUST be an MCQ with exactly 4 options (A, B, C, D).
+- Correct answer index: 0=A, 1=B, 2=C, 3=D.
+- Questions should be TOUGH and at the exact level of actual ${examName} examination.
+- Include a detailed modelAnswer (explanation) for each question.
+- Include difficulty (easy, medium, hard) and topic tag for each question.
+- Return ONLY a valid JSON array. NO markdown, NO code blocks, NO extra text.
+
+PREVIOUS YEAR QUESTION (PYQ) CONTENT:
 ${pyqText || 'No PYQ content provided.'}
 
 SYLLABUS CONTENT:
-${syllabusText || 'No syllabus provided. Generate based on exam pattern.'}
+${syllabusText || 'No syllabus provided.'}
 
 JSON FORMAT (return ONLY this array, no other text):
 [
@@ -905,20 +976,24 @@ JSON FORMAT (return ONLY this array, no other text):
     "question": "Question text here",
     "options": ["Option A", "Option B", "Option C", "Option D"],
     "correctAnswer": 0,
-    "modelAnswer": "Detailed explanation of the correct answer",
-    "marks": 4,
-    "difficulty": "hard",
+    "modelAnswer": "Detailed explanation with step-by-step reasoning",
+    "marks": 1,
+    "difficulty": "medium",
     "topic": "topic name",
     "type": "mcq"
   }
 ]`;
-  return prompt;
 }
 
 async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration) {
   try {
     if (!aiMockEnabled) {
       return { success: false, error: 'AI Mock API not configured. Please set AI_API_MOCK environment variable.' };
+    }
+
+    const plan = getExamBatchPlan(config.examName);
+    if (!plan) {
+      return { success: false, error: `Unknown exam: ${config.examName}. Supported exams: NEET, JEE, GATE, WBJEE.` };
     }
 
     const pyqFiles = (config.pyqFiles || []).filter(f => f.gridfsId);
@@ -941,7 +1016,7 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       return { success: false, error: 'No PYQ or syllabus content found for this exam.' };
     }
 
-    const MAX_CHARS = 12000;
+    const MAX_CHARS = 6000;
     let combinedPyqText = pyqText;
     if (combinedPyqText.length > MAX_CHARS) {
       combinedPyqText = combinedPyqText.substring(0, MAX_CHARS) + '\n\n[Additional PYQ content truncated...]';
@@ -951,58 +1026,81 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       combinedSyllabusText = combinedSyllabusText.substring(0, MAX_CHARS) + '\n\n[Additional syllabus content truncated...]';
     }
 
-    const prompt = buildCompetitiveAIPrompt(config.examName, totalMarks, duration, combinedPyqText, combinedSyllabusText);
+    // Generate each batch sequentially
+    const allQuestions = [];
+    const totalBatches = plan.batches.length;
+    let failedBatches = 0;
 
-    const aiResponse = await callAIMock(prompt);
-    if (!aiResponse) {
-      return { success: false, error: 'AI generation failed. Please check your AI_API_MOCK configuration.' };
+    for (let i = 0; i < totalBatches; i++) {
+      const batch = plan.batches[i];
+      console.log(`[Competitive Mock] Generating batch ${i + 1}/${totalBatches}: ${batch.name} (${batch.count} questions)`);
+
+      const prompt = buildBatchPrompt(config.examName, batch, i, totalBatches, combinedPyqText, combinedSyllabusText);
+
+      const aiResponse = await callAIMock(prompt, config.examName);
+      if (!aiResponse) {
+        console.error(`[Competitive Mock] Batch ${i + 1} failed: no AI response`);
+        failedBatches++;
+        continue;
+      }
+
+      // Clean up response
+      let cleanedResponse = aiResponse.trim();
+      if (cleanedResponse.startsWith('```json')) {
+        cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+      } else if (cleanedResponse.startsWith('```')) {
+        cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
+      }
+      cleanedResponse = cleanedResponse.trim();
+
+      let rawQuestions;
+      try {
+        rawQuestions = JSON.parse(cleanedResponse);
+      } catch (parseErr) {
+        console.error(`[Competitive Mock] Batch ${i + 1} JSON parse error:`, parseErr.message);
+        console.error('Raw response (first 300 chars):', cleanedResponse.substring(0, 300));
+        failedBatches++;
+        continue;
+      }
+
+      if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+        console.error(`[Competitive Mock] Batch ${i + 1} generated no valid questions`);
+        failedBatches++;
+        continue;
+      }
+
+      // Validate and normalize each question
+      let batchValidCount = 0;
+      for (const q of rawQuestions) {
+        if (!q.question) continue;
+        if (!Array.isArray(q.options) || q.options.length !== 4) continue;
+        if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+        allQuestions.push({
+          question: q.question.trim(),
+          options: q.options.map(o => String(o).trim()),
+          correctAnswer: Math.round(q.correctAnswer),
+          modelAnswer: q.modelAnswer || '',
+          marks: Number(q.marks) || 1,
+          difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
+          topic: q.topic || batch.topics,
+          type: 'mcq'
+        });
+        batchValidCount++;
+      }
+      console.log(`[Competitive Mock] Batch ${i + 1}: ${batchValidCount} valid questions added`);
     }
 
-    // Clean up response
-    let cleanedResponse = aiResponse.trim();
-    if (cleanedResponse.startsWith('```json')) {
-      cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-    } else if (cleanedResponse.startsWith('```')) {
-      cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
-    }
-    cleanedResponse = cleanedResponse.trim();
-
-    let rawQuestions;
-    try {
-      rawQuestions = JSON.parse(cleanedResponse);
-    } catch (parseErr) {
-      console.error('AI Mock JSON parse error:', parseErr.message);
-      console.error('Raw response (first 500 chars):', cleanedResponse.substring(0, 500));
-      return { success: false, error: 'AI returned invalid JSON format. The AI response could not be parsed into questions.' };
+    if (allQuestions.length === 0) {
+      return { success: false, error: 'No valid questions generated from any batch. Please check AI_API_MOCK configuration and try again.' };
     }
 
-    if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
-      return { success: false, error: 'AI generated no valid questions.' };
+    if (failedBatches > 0) {
+      console.warn(`[Competitive Mock] ${failedBatches} of ${totalBatches} batches failed. Generated ${allQuestions.length} of ${plan.totalQuestions} target questions.`);
+    } else {
+      console.log(`[Competitive Mock] All batches successful. Generated ${allQuestions.length} questions.`);
     }
 
-    // Validate and normalize each question
-    const questions = [];
-    for (const q of rawQuestions) {
-      if (!q.question) continue;
-      if (!Array.isArray(q.options) || q.options.length !== 4) continue;
-      if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
-      questions.push({
-        question: q.question.trim(),
-        options: q.options.map(o => String(o).trim()),
-        correctAnswer: Math.round(q.correctAnswer),
-        modelAnswer: q.modelAnswer || '',
-        marks: Number(q.marks) || 4,
-        difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
-        topic: q.topic || '',
-        type: 'mcq'
-      });
-    }
-
-    if (questions.length === 0) {
-      return { success: false, error: 'No valid questions after validation. The AI response did not contain properly formatted questions.' };
-    }
-
-    return { success: true, questions };
+    return { success: true, questions: allQuestions };
   } catch (err) {
     console.error('generateCompetitiveQuestionsFromExam error:', err);
     return { success: false, error: err.message };
@@ -1903,16 +2001,11 @@ app.get('/api/admin/ai-mock-status', authMiddleware, adminMiddleware, (req, res)
   });
 });
 
-// User: List available competitive exams (only those with PYQ or syllabus)
+// User: List available competitive exams (return all active configs, frontend decides availability)
 app.get('/api/competitive-exams', authMiddleware, async (req, res) => {
   try {
-    const configs = await CompetitiveExamConfig.find({ status: 'active' }).select('-__v');
-    const available = configs.filter(c => {
-      const hasPyq = (c.pyqFiles && c.pyqFiles.length > 0) || c.pyqText;
-      const hasSyllabus = (c.syllabusFiles && c.syllabusFiles.length > 0) || c.syllabusText;
-      return hasPyq || hasSyllabus;
-    });
-    res.json(available);
+    const configs = await CompetitiveExamConfig.find({ status: 'active' }).select('-__v').sort({ examName: 1 });
+    res.json(configs);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Server error' });
