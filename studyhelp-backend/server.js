@@ -407,28 +407,38 @@ function parseAIResponse(aiResponse, batch) {
 
   let cleanedResponse = aiResponse.trim();
 
-  // Extract JSON array from the response (in case there's extra text before/after)
-  const jsonStart = cleanedResponse.indexOf('[');
-  const jsonEnd = cleanedResponse.lastIndexOf(']');
-  if (jsonStart >= 0 && jsonEnd > jsonStart) {
-    cleanedResponse = cleanedResponse.substring(jsonStart, jsonEnd + 1);
+  // Remove markdown code blocks if present
+  if (cleanedResponse.startsWith('```json')) {
+    cleanedResponse = cleanedResponse.substring(7);
+    if (cleanedResponse.endsWith('```')) cleanedResponse = cleanedResponse.slice(0, -3);
+  } else if (cleanedResponse.startsWith('```')) {
+    cleanedResponse = cleanedResponse.substring(3);
+    if (cleanedResponse.endsWith('```')) cleanedResponse = cleanedResponse.slice(0, -3);
+  }
+  cleanedResponse = cleanedResponse.trim();
+
+  // Extract just the JSON array — find first '[' and last ']'
+  const firstBracket = cleanedResponse.indexOf('[');
+  const lastBracket = cleanedResponse.lastIndexOf(']');
+  if (firstBracket >= 0 && lastBracket > firstBracket) {
+    cleanedResponse = cleanedResponse.substring(firstBracket, lastBracket + 1);
   }
 
-  // Fix common malformed JSON issues from the AI
-  cleanedResponse = cleanedResponse
-    .replace(/\n/g, '\\n')           // Escape newlines inside strings
-    .replace(/\r/g, '\\r')           // Escape carriage returns
-    .replace(/\t/g, '\\t')           // Escape tabs
-    .replace(/\\(?!["\\\/bfnrt])/g, '') // Remove invalid escape sequences (backslash not followed by valid JSON escape char)
-    .replace(/\u0000/g, '');           // Remove null characters
+  // Fix common AI output issues that break JSON:
+  // 1. Unescaped newlines inside string values → replace with space
+  cleanedResponse = cleanedResponse.replace(/\n\s*/g, ' ');
+  // 2. Remove null characters
+  cleanedResponse = cleanedResponse.replace(/\u0000/g, '');
+  // 3. Fix trailing commas before closing brackets
+  cleanedResponse = cleanedResponse.replace(/,\s*([}\]])/g, '$1');
 
   let rawQuestions;
   try {
     rawQuestions = JSON.parse(cleanedResponse);
   } catch (parseErr) {
     console.error(`[Competitive Mock] JSON parse error: ${parseErr.message}`);
-    console.error(`[Competitive Mock] Raw first 200 chars: ${cleanedResponse.substring(0, 200)}`);
-    console.error(`[Competitive Mock] Raw last 200 chars: ${cleanedResponse.substring(cleanedResponse.length - 200)}`);
+    console.error(`[Competitive Mock] Cleaned first 300 chars: ${cleanedResponse.substring(0, 300)}`);
+    console.error(`[Competitive Mock] Cleaned last 300 chars: ${cleanedResponse.substring(cleanedResponse.length - 300)}`);
     return { questions: [], error: 'JSON parse error: ' + parseErr.message };
   }
 
