@@ -70,9 +70,9 @@ if (AI_API_MOCK_KEYS.length === 0) {
 const aiMockEnabled = AI_API_MOCK_KEYS.length > 0;
 const MOCKS_PER_KEY = 2;          // how many requests per key before cooldown
 const KEY_COOLDOWN_MS = 60000;    // 60s between uses of the same key
-const PAUSE_BETWEEN_ROUNDS_MS = 45000; // 45s pause between parallel rounds
+const PAUSE_BETWEEN_ROUNDS_MS = 60000; // 60s pause between parallel rounds (matches key cooldown to let TPM fully reset)
 
-// Track per-key cooldown to respect each account's 12K TPM limit
+// Track per-key cooldown to respect each account's rate limit
 const keyCooldowns = AI_API_MOCK_KEYS.map(() => 0);
 
 function getAvailableKey() {
@@ -82,12 +82,17 @@ function getAvailableKey() {
   }
   return -1; // all on cooldown
 }
-function markKeyUsed(keyIndex) {
-  keyCooldowns[keyIndex] = Date.now() + KEY_COOLDOWN_MS;
+function markKeyUsed(keyIndex, customCooldownMs = KEY_COOLDOWN_MS) {
+  keyCooldowns[keyIndex] = Date.now() + customCooldownMs;
 }
 function waitForAnyKey() {
   const earliest = Math.min(...keyCooldowns);
   const waitMs = earliest - Date.now();
+  if (waitMs > 0) return delay(waitMs + 1000);
+  return Promise.resolve();
+}
+function waitForKey(keyIndex) {
+  const waitMs = keyCooldowns[keyIndex] - Date.now();
   if (waitMs > 0) return delay(waitMs + 1000);
   return Promise.resolve();
 }
@@ -586,12 +591,12 @@ async function runBatchWithKey(config, batch, batchIndex, totalBatches, pyqText,
   const apiKey = AI_API_MOCK_KEYS[keyIndex];
   console.log(`[Competitive Mock] Batch ${batchIndex + 1}: ${batch.name} (${batch.count} questions) — using key ${keyIndex + 1}/${AI_API_MOCK_KEYS.length}`);
 
-  const result = await callGroqMock(prompt, apiKey, Math.min(6000, 2000 + batch.count * 500));
+  const result = await callGroqMock(prompt, apiKey, 4000);
 
   if (!result.success && result.retryAfter) {
-    markKeyUsed(keyIndex); // cooldown the rate-limited key
+    markKeyUsed(keyIndex, (result.retryAfter * 1000) + 3000); // cooldown the rate-limited key using actual retryAfter + 3s buffer
     console.log(`[Competitive Mock] Batch ${batchIndex + 1} rate limited, key ${keyIndex + 1} cooled down for ${result.retryAfter}s`);
-    return { success: false, error: 'Rate limited' };
+    return { success: false, error: 'Rate limited', retryAfter: result.retryAfter };
   }
 
   if (!result.success || !result.content) {
@@ -670,11 +675,13 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       let batch2 = null;
 
       // Try to pair with a second batch if another key is available
+      // Stagger the second request by 3s to avoid TPM burst on both keys simultaneously
       batchIndex++;
       if (batchIndex < plan.batches.length) {
         const availableKey2 = getAvailableKey();
         if (availableKey2 >= 0 && availableKey2 !== availableKey1) {
           batch2 = plan.batches[batchIndex];
+          await delay(3000); // stagger second request to spread TPM load
           promise2 = runBatchWithKey(config, batch2, batchIndex, plan.batches.length, combinedPyqText, combinedSyllabusText, availableKey2);
           markKeyUsed(availableKey2);
           batchIndex++;
@@ -704,7 +711,7 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
             console.log(`[Competitive Mock] Batch ${currentBatchIndex + 1} underfilled: ${result.questions.length}/${currentBatch.count}. Will retry for ${missing} more.`);
           }
         } else {
-          failedBatches.push({ batchIndex: currentBatchIndex, batch: currentBatch });
+          failedBatches.push({ batchIndex: currentBatchIndex, batch: currentBatch, error: result.error || 'Unknown', retryAfter: result.retryAfter || 0 });
           console.error(`[Competitive Mock] Batch ${currentBatchIndex + 1} FAILED: ${result.error || 'Unknown error'}`);
         }
       }
@@ -723,6 +730,12 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       console.log(`[Competitive Mock] Retrying ${failedBatches.length} failed batch(es)...`);
       for (let attempt = 0; attempt < failedBatches.length; attempt++) {
         const retry = failedBatches[attempt];
+        // If previous failure was rate limit, wait for the specific retryAfter + buffer
+        if (retry.error === 'Rate limited' && retry.retryAfter > 0) {
+          const waitTime = (retry.retryAfter * 1000) + 3000;
+          console.log(`[Competitive Mock] Waiting ${Math.round(waitTime / 1000)}s for rate limit cooldown before retrying batch ${retry.batchIndex + 1}...`);
+          await delay(waitTime);
+        }
         let availableKey = getAvailableKey();
         if (availableKey < 0) {
           await waitForAnyKey();
