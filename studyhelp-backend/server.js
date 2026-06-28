@@ -58,45 +58,37 @@ const AI_API_BASE = process.env.AI_API_BASE || 'https://api.openai.com/v1';
 const AI_MODEL = process.env.AI_MODEL || 'llama-3.3-70b-versatile';
 const aiEnabled = !!AI_API_KEY;
 
-// Competitive Mock Test AI config — 10 rotating API keys for parallel generation
+// ========== GEMINI AI STUDIO CONFIG FOR COMPETITIVE MOCK TESTS ==========
+// Google AI Studio free tier: 1M TPM, 60 RPM, 1,500 RPD
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const geminiEnabled = !!GEMINI_API_KEY;
+const GEMINI_MODEL = 'gemini-2.0-flash';
+
+// Fallback Groq keys (kept for compatibility, but Gemini is preferred)
 const AI_API_MOCK_KEYS = [];
 for (let i = 1; i <= 10; i++) {
   const key = process.env[`AI_API_MOCK${i}`];
   if (key) AI_API_MOCK_KEYS.push(key);
 }
-// Fallback: if no numbered keys, use the single AI_API_MOCK or AI_API_KEY
 if (AI_API_MOCK_KEYS.length === 0) {
   const fallback = process.env.AI_API_MOCK || process.env.AI_API_KEY || '';
   if (fallback) AI_API_MOCK_KEYS.push(fallback);
 }
-const aiMockEnabled = AI_API_MOCK_KEYS.length > 0;
+const aiMockEnabled = geminiEnabled || AI_API_MOCK_KEYS.length > 0;
 
-// Hardcode model to llama-3.1-8b-instant (30K TPM) — avoid env var confusion
-const AI_MODEL_MOCK = 'llama-3.1-8b-instant';
-
-let keyIndex = 0;
-function getNextMockKey() {
-  const key = AI_API_MOCK_KEYS[keyIndex % AI_API_MOCK_KEYS.length];
-  keyIndex++;
-  return key;
-}
 function getRandomMockKey() {
   return AI_API_MOCK_KEYS[Math.floor(Math.random() * AI_API_MOCK_KEYS.length)];
 }
 
-// Global rate-limit tracker for competitive mock tests
+// Global rate-limit tracker (only used for Groq fallback)
 let nextSafeRequestTime = 0;
-function canMakeRequest() {
-  return Date.now() >= nextSafeRequestTime;
-}
 function recordRateLimit(retryAfterSeconds) {
-  nextSafeRequestTime = Date.now() + (retryAfterSeconds * 1000) + 2000; // +2s buffer
-  console.log(`[Competitive Mock] Global rate limit recorded. Next safe request at ${new Date(nextSafeRequestTime).toISOString()}`);
+  nextSafeRequestTime = Date.now() + (retryAfterSeconds * 1000) + 2000;
 }
 function waitForSafeRequest() {
   const waitMs = nextSafeRequestTime - Date.now();
   if (waitMs > 0) {
-    console.log(`[Competitive Mock] Waiting ${Math.ceil(waitMs / 1000)}s for global rate limit to clear...`);
+    console.log(`[Competitive Mock] Waiting ${Math.ceil(waitMs / 1000)}s for rate limit...`);
     return delay(waitMs);
   }
   return Promise.resolve();
@@ -108,6 +100,114 @@ mongoose.connect(process.env.MONGODB_URI)
     console.error('MongoDB connection error:', err);
     process.exit(1);
   });
+
+// Delay helper
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ========== GEMINI API CALL ==========
+// Google AI Studio (Gemini) has 1M TPM free tier — perfect for competitive exam generation
+async function callGemini(prompt) {
+  if (!geminiEnabled) {
+    return { success: false, error: 'Gemini API key not configured', content: null };
+  }
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: prompt }]
+          }
+        ],
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 8192,
+          topP: 0.95,
+          topK: 40
+        }
+      })
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error('Gemini API error:', errText);
+      return { success: false, error: `Gemini API error: ${res.status}`, content: null };
+    }
+
+    const data = await res.json();
+    
+    // Handle Gemini response format
+    if (data.error) {
+      console.error('Gemini API error:', data.error);
+      return { success: false, error: data.error.message || 'Gemini error', content: null };
+    }
+
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || null;
+    if (!text) {
+      console.error('Gemini returned no text content');
+      return { success: false, error: 'Empty response from Gemini', content: null };
+    }
+
+    return { success: true, error: null, content: text };
+  } catch (err) {
+    console.error('Gemini call failed:', err);
+    return { success: false, error: err.message, content: null };
+  }
+}
+
+// ========== GROQ FALLBACK (kept for compatibility) ==========
+async function callGroqMock(prompt, apiKey) {
+  if (!apiKey) {
+    return { success: false, rateLimited: false, retryAfter: 0, error: 'No API key', content: null };
+  }
+  try {
+    const maxTokens = 3000;
+    const res = await fetch(`${AI_API_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages: [
+          { role: 'system', content: 'You are an expert competitive exam question setter. You generate tough, exam-level questions. You always respond with valid JSON only, no markdown, no explanations, no code blocks.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.7,
+        max_tokens: maxTokens
+      })
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      try {
+        const errData = JSON.parse(errText);
+        if (errData?.error?.code === 'rate_limit_exceeded') {
+          const msg = errData.error.message || '';
+          const retryMatch = msg.match(/try again in ([\d.]+)s/i);
+          const retryAfter = retryMatch ? parseFloat(retryMatch[1]) : 60;
+          recordRateLimit(retryAfter);
+          return { success: false, rateLimited: true, retryAfter, content: null };
+        }
+      } catch (e) {}
+      console.error('Groq API error:', errText);
+      return { success: false, rateLimited: false, retryAfter: 0, content: null };
+    }
+    
+    const data = await res.json();
+    return { success: true, rateLimited: false, retryAfter: 0, content: data.choices?.[0]?.message?.content || null };
+  } catch (err) {
+    console.error('Groq call failed:', err);
+    return { success: false, rateLimited: false, retryAfter: 0, content: null };
+  }
+}
 
 const studentSchema = new mongoose.Schema({
   name: String,
@@ -686,9 +786,7 @@ async function callAIMock(prompt, apiKey) {
     return { success: false, rateLimited: false, retryAfter: 0, error: 'No API key' };
   }
   try {
-    const maxTokens = 5000; // Enough for ~15 questions per batch without truncation
-
-    console.log(`[Competitive Mock] Calling AI model: ${AI_MODEL_MOCK}, max_tokens: ${maxTokens}`);
+    const maxTokens = 3000; // Reduced for Groq fallback (12K TPM limit)
 
     const res = await fetch(`${AI_API_BASE}/chat/completions`, {
       method: 'POST',
@@ -697,9 +795,9 @@ async function callAIMock(prompt, apiKey) {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: AI_MODEL_MOCK,
+        model: 'llama-3.1-8b-instant',
         messages: [
-          { role: 'system', content: 'You are an expert competitive exam question setter. You generate tough, exam-level questions for competitive examinations (NEET, JEE, GATE, WBJEE). You always respond with valid JSON only, no markdown, no explanations, no code blocks. You must generate the exact number of questions requested in the prompt.' },
+          { role: 'system', content: 'You are an expert competitive exam question setter. You generate tough, exam-level questions. You always respond with valid JSON only, no markdown, no explanations, no code blocks.' },
           { role: 'user', content: prompt }
         ],
         temperature: 0.7,
@@ -711,17 +809,15 @@ async function callAIMock(prompt, apiKey) {
       const errText = await res.text();
       const errData = JSON.parse(errText);
       
-      // Detect Groq rate limit
       if (errData?.error?.code === 'rate_limit_exceeded') {
         const msg = errData.error.message || '';
         const retryMatch = msg.match(/try again in ([\d.]+)s/i);
         const retryAfter = retryMatch ? parseFloat(retryMatch[1]) : 60;
-        console.log(`[Competitive Mock] Rate limited. Retry after ${retryAfter}s`);
         recordRateLimit(retryAfter);
         return { success: false, rateLimited: true, retryAfter, content: null };
       }
       
-      console.error('AI Mock API error:', errText);
+      console.error('Groq API error:', errText);
       return { success: false, rateLimited: false, retryAfter: 0, content: null };
     }
     
@@ -733,7 +829,7 @@ async function callAIMock(prompt, apiKey) {
       content: data.choices?.[0]?.message?.content || null 
     };
   } catch (err) {
-    console.error('AI Mock call failed:', err);
+    console.error('Groq call failed:', err);
     return { success: false, rateLimited: false, retryAfter: 0, content: null };
   }
 }
@@ -1014,6 +1110,68 @@ function getExamBatchPlan(examName) {
   return plans[examName] || null;
 }
 
+// Build a SINGLE large prompt for Gemini to generate the entire exam at once
+function buildFullExamPrompt(examName, totalMarks, duration, pyqText, syllabusText, plan) {
+  const diffInstructions = {
+    'GATE': `CRITICAL: These must be at GATE (Graduate Aptitude Test in Engineering) difficulty level — one of India's toughest technical exams. Questions require deep conceptual understanding, multi-step problem solving, and application of formulas in non-obvious ways. 60% HARD, 30% MEDIUM, 10% EASY. Every question must have at least one plausible distractor (wrong option) that tests common misconceptions.`,
+    'NEET': `CRITICAL: NEET-level difficulty. Biology tests NCERT application beyond rote memorization. Physics is numerical and conceptual. Chemistry tests mechanisms and reactions. 40% HARD, 40% MEDIUM, 20% EASY. Each question is 4 marks.`,
+    'JEE': `CRITICAL: JEE Main/Advanced level — among the toughest engineering exams globally. Physics and Chemistry are deeply conceptual with multi-step problems. Mathematics requires clever substitutions and non-obvious approaches. 50% HARD, 35% MEDIUM, 15% EASY. Each question is 4 marks.`,
+    'WBJEE': `CRITICAL: WBJEE state-level competitive exam. Mathematics has subtle traps. Physics and Chemistry are moderate. 35% HARD, 45% MEDIUM, 20% EASY.`
+  };
+
+  const diffText = diffInstructions[examName] || 'Generate at actual exam difficulty level. 40% HARD, 40% MEDIUM, 20% EASY.';
+
+  // Build section breakdown from the batch plan
+  const sectionsText = plan.batches.map((batch, i) => {
+    return `Section ${i + 1}: ${batch.name}
+- Questions: ${batch.count}
+- Marks: ${batch.marks}
+- Topics: ${batch.topics}
+- ${batch.instructions}`;
+  }).join('\n\n');
+
+  return `You are an expert Question Setter for the ${examName} examination. Generate a COMPLETE ${examName} mock test paper with exactly ${plan.totalQuestions} questions that follows the real exam pattern.
+
+${diffText}
+
+EXAM PATTERN:
+- Exam: ${examName}
+- Total Marks: ${totalMarks}
+- Duration: ${duration} minutes
+- Total Questions: ${plan.totalQuestions}
+
+SECTION BREAKDOWN:
+${sectionsText}
+
+QUESTION RULES:
+1. Each question MUST be a Multiple Choice Question with exactly 4 options (A, B, C, D).
+2. Correct answer: 0-based index (0=A, 1=B, 2=C, 3=D).
+3. Include a detailed modelAnswer with step-by-step reasoning for every question.
+4. Include difficulty (easy, medium, hard) and a specific topic tag for each question.
+5. Return ONLY a valid JSON array. NO markdown, NO code blocks, NO extra text outside the JSON.
+6. CRITICAL: You MUST generate exactly ${plan.totalQuestions} questions total. Do not generate fewer.
+
+PREVIOUS YEAR QUESTION (PYQ) CONTENT (study the pattern and difficulty):
+${pyqText || 'No PYQ content provided.'}
+
+SYLLABUS CONTENT (cover these topics evenly):
+${syllabusText || 'No syllabus provided.'}
+
+JSON FORMAT (return ONLY this array, no other text):
+[
+  {
+    "question": "Question text here",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correctAnswer": 0,
+    "modelAnswer": "Detailed step-by-step explanation",
+    "marks": 1,
+    "difficulty": "hard",
+    "topic": "specific topic",
+    "type": "mcq"
+  }
+]`;
+}
+
 function buildBatchPrompt(examName, batch, batchIndex, totalBatches, pyqText, syllabusText) {
   // Exam-specific difficulty instructions
   const difficultyInstructions = {
@@ -1173,7 +1331,7 @@ async function generateBatchWithRetry(config, batch, batchIndex, totalBatches, p
 async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration) {
   try {
     if (!aiMockEnabled) {
-      return { success: false, error: 'AI Mock API not configured. Please set at least one AI_API_MOCK1..10 environment variable.' };
+      return { success: false, error: 'AI not configured. Please set GEMINI_API_KEY or AI_API_MOCK1..10 environment variables.' };
     }
 
     const plan = getExamBatchPlan(config.examName);
@@ -1200,7 +1358,7 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       return { success: false, error: 'No PYQ or syllabus content found for this exam.' };
     }
 
-    const MAX_CHARS = 1200;
+    const MAX_CHARS = 3000;
     let combinedPyqText = pyqText;
     if (combinedPyqText.length > MAX_CHARS) {
       combinedPyqText = combinedPyqText.substring(0, MAX_CHARS) + '\n\n[Truncated...]';
@@ -1210,29 +1368,48 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       combinedSyllabusText = combinedSyllabusText.substring(0, MAX_CHARS) + '\n\n[Truncated...]';
     }
 
-    console.log(`[Competitive Mock] Starting SEQUENTIAL generation for ${config.examName} with ${AI_API_MOCK_KEYS.length} key(s). Model: ${AI_MODEL_MOCK}. ${plan.batches.length} batches.`);
-    const startTime = Date.now();
+    // Build exam-specific full prompt
+    const prompt = buildFullExamPrompt(config.examName, totalMarks, duration, combinedPyqText, combinedSyllabusText, plan);
 
-    // Run batches SEQUENTIALLY with a delay between each to respect rate limits
+    // ====== PRIMARY: Gemini (1M TPM free tier) ======
+    if (geminiEnabled) {
+      console.log(`[Competitive Mock] Using Gemini (${GEMINI_MODEL}) for ${config.examName} — generating ${plan.totalQuestions} questions in one request...`);
+      const startTime = Date.now();
+      
+      const geminiResult = await callGemini(prompt);
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      
+      if (geminiResult.success && geminiResult.content) {
+        const result = parseAIResponse(geminiResult.content, { topics: config.examName });
+        if (result.questions.length > 0) {
+          console.log(`[Competitive Mock] Gemini generated ${result.questions.length} questions in ${elapsed}s`);
+          return { success: true, questions: result.questions };
+        }
+      }
+      console.log(`[Competitive Mock] Gemini failed or returned empty. Falling back to Groq...`);
+    }
+
+    // ====== FALLBACK: Groq (sequential batches) ======
+    console.log(`[Competitive Mock] Using Groq fallback for ${config.examName}. ${plan.batches.length} batches, ${AI_API_MOCK_KEYS.length} key(s).`);
+    const startTime = Date.now();
     const allQuestions = [];
     let failedBatches = 0;
-    const INTER_BATCH_DELAY_MS = 30000; // 30 seconds between batches (for 12K TPM limit: ~5800 tokens/request, 2 requests/min max)
+    const INTER_BATCH_DELAY_MS = 30000;
 
     for (let i = 0; i < plan.batches.length; i++) {
       const batch = plan.batches[i];
-      console.log(`[Competitive Mock] Starting batch ${i + 1}/${plan.batches.length}: ${batch.name} (${batch.count} questions)`);
+      console.log(`[Competitive Mock] Batch ${i + 1}/${plan.batches.length}: ${batch.name} (${batch.count} questions)`);
 
       const result = await generateBatchWithRetry(config, batch, i, plan.batches.length, combinedPyqText, combinedSyllabusText, 2);
 
       if (result.success && result.questions.length > 0) {
         allQuestions.push(...result.questions);
-        console.log(`[Competitive Mock] Batch ${i + 1} complete. Total so far: ${allQuestions.length} questions.`);
+        console.log(`[Competitive Mock] Batch ${i + 1} complete. Total: ${allQuestions.length} questions.`);
       } else {
         failedBatches++;
-        console.error(`[Competitive Mock] Batch ${i + 1} failed after all retries.`);
+        console.error(`[Competitive Mock] Batch ${i + 1} failed.`);
       }
 
-      // Wait between batches (except after the last one)
       if (i < plan.batches.length - 1) {
         console.log(`[Competitive Mock] Waiting ${INTER_BATCH_DELAY_MS / 1000}s before next batch...`);
         await delay(INTER_BATCH_DELAY_MS);
@@ -1240,14 +1417,13 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
     }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[Competitive Mock] Sequential generation completed in ${elapsed}s`);
+    console.log(`[Competitive Mock] Groq fallback completed in ${elapsed}s`);
 
     if (allQuestions.length === 0) {
-      return { success: false, error: 'All batches failed. No questions generated. Please check AI_API_MOCK keys and try again.' };
+      return { success: false, error: 'All generation attempts failed. Please check AI configuration.' };
     }
 
-    console.log(`[Competitive Mock] ${plan.batches.length - failedBatches}/${plan.batches.length} batches succeeded. Generated ${allQuestions.length} questions (target: ${plan.totalQuestions}).`);
-
+    console.log(`[Competitive Mock] Generated ${allQuestions.length} questions (target: ${plan.totalQuestions}).`);
     return { success: true, questions: allQuestions };
   } catch (err) {
     console.error('generateCompetitiveQuestionsFromExam error:', err);
@@ -2140,14 +2316,15 @@ app.delete('/api/admin/competitive-exams/:examName', authMiddleware, adminMiddle
 // Admin: Check AI Mock configuration status
 app.get('/api/admin/ai-mock-status', authMiddleware, adminMiddleware, (req, res) => {
   res.json({
+    geminiEnabled,
+    geminiModel: GEMINI_MODEL,
+    groqKeys: AI_API_MOCK_KEYS.length,
     aiMockEnabled,
-    apiKeyCount: AI_API_MOCK_KEYS.length,
-    apiBase: AI_API_BASE,
-    model: AI_MODEL_MOCK,
-    fallbackModel: AI_MODEL,
-    message: aiMockEnabled
-      ? `AI Mock API configured with ${AI_API_MOCK_KEYS.length} key(s). Model: ${AI_MODEL_MOCK}. Sequential generation with rate-limit protection enabled.`
-      : 'No AI_API_MOCK1..10 keys configured. Set at least one AI_API_MOCK{N} environment variable.'
+    message: geminiEnabled
+      ? `Gemini AI (${GEMINI_MODEL}) connected. 1M TPM free tier — fast generation with no rate limits.`
+      : (AI_API_MOCK_KEYS.length > 0
+        ? `Groq fallback only (${AI_API_MOCK_KEYS.length} key(s)). Limited to ~12K TPM — slow generation.`
+        : 'No AI keys configured. Set GEMINI_API_KEY for Google AI Studio, or AI_API_MOCK1..10 for Groq.')
   });
 });
 
