@@ -406,17 +406,29 @@ function parseAIResponse(aiResponse, batch) {
   if (!aiResponse) return { questions: [], error: 'No AI response' };
 
   let cleanedResponse = aiResponse.trim();
-  if (cleanedResponse.startsWith('```json')) {
-    cleanedResponse = cleanedResponse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-  } else if (cleanedResponse.startsWith('```')) {
-    cleanedResponse = cleanedResponse.replace(/^```\s*/, '').replace(/\s*```$/, '');
+
+  // Extract JSON array from the response (in case there's extra text before/after)
+  const jsonStart = cleanedResponse.indexOf('[');
+  const jsonEnd = cleanedResponse.lastIndexOf(']');
+  if (jsonStart >= 0 && jsonEnd > jsonStart) {
+    cleanedResponse = cleanedResponse.substring(jsonStart, jsonEnd + 1);
   }
-  cleanedResponse = cleanedResponse.trim();
+
+  // Fix common malformed JSON issues from the AI
+  cleanedResponse = cleanedResponse
+    .replace(/\n/g, '\\n')           // Escape newlines inside strings
+    .replace(/\r/g, '\\r')           // Escape carriage returns
+    .replace(/\t/g, '\\t')           // Escape tabs
+    .replace(/\\(?!["\\\/bfnrt])/g, '') // Remove invalid escape sequences (backslash not followed by valid JSON escape char)
+    .replace(/\u0000/g, '');           // Remove null characters
 
   let rawQuestions;
   try {
     rawQuestions = JSON.parse(cleanedResponse);
   } catch (parseErr) {
+    console.error(`[Competitive Mock] JSON parse error: ${parseErr.message}`);
+    console.error(`[Competitive Mock] Raw first 200 chars: ${cleanedResponse.substring(0, 200)}`);
+    console.error(`[Competitive Mock] Raw last 200 chars: ${cleanedResponse.substring(cleanedResponse.length - 200)}`);
     return { questions: [], error: 'JSON parse error: ' + parseErr.message };
   }
 
@@ -436,7 +448,7 @@ function parseAIResponse(aiResponse, batch) {
       modelAnswer: q.modelAnswer || '',
       marks: Number(q.marks) || 1,
       difficulty: ['easy', 'medium', 'hard'].includes(q.difficulty) ? q.difficulty : 'medium',
-      topic: q.topic || batch.topics,
+      topic: q.topic || (batch && batch.topics) || '',
       type: 'mcq'
     });
   }
@@ -514,7 +526,7 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
     const startTime = Date.now();
 
     const allQuestions = [];
-    let failedBatches = 0;
+    const failedBatches = []; // stores { batchIndex, batch } for retry
 
     // Process batches in rounds: up to 2 batches per round (one per key), with cooldown between rounds
     let batchIndex = 0;
@@ -549,12 +561,15 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
         ? await Promise.all([promise1, promise2])
         : [await promise1];
 
-      for (const result of results) {
+      for (let i = 0; i < results.length; i++) {
+        const result = results[i];
+        const currentBatch = i === 0 ? batch1 : batch2;
+        const currentBatchIndex = batchIndex - results.length + i;
         if (result.success && result.questions.length > 0) {
           allQuestions.push(...result.questions);
         } else {
-          failedBatches++;
-          console.error(`[Competitive Mock] Batch FAILED: ${result.error || 'Unknown error'}`);
+          failedBatches.push({ batchIndex: currentBatchIndex, batch: currentBatch });
+          console.error(`[Competitive Mock] Batch ${currentBatchIndex + 1} FAILED: ${result.error || 'Unknown error'}`);
         }
       }
 
@@ -564,6 +579,30 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       if (batchIndex < plan.batches.length) {
         console.log(`[Competitive Mock] Pausing ${PAUSE_BETWEEN_ROUNDS_MS / 1000}s before next round...`);
         await delay(PAUSE_BETWEEN_ROUNDS_MS);
+      }
+    }
+
+    // Retry failed batches once at the end with any available key
+    if (failedBatches.length > 0) {
+      console.log(`[Competitive Mock] Retrying ${failedBatches.length} failed batch(es)...`);
+      for (let attempt = 0; attempt < failedBatches.length; attempt++) {
+        const retry = failedBatches[attempt];
+        let availableKey = getAvailableKey();
+        if (availableKey < 0) {
+          await waitForAnyKey();
+          availableKey = getAvailableKey();
+          if (availableKey < 0) availableKey = 0;
+        }
+        const retryResult = await runBatchWithKey(config, retry.batch, retry.batchIndex, plan.batches.length, combinedPyqText, combinedSyllabusText, availableKey);
+        if (retryResult.success && retryResult.questions.length > 0) {
+          allQuestions.push(...retryResult.questions);
+          console.log(`[Competitive Mock] Retry batch ${retry.batchIndex + 1}: ${retryResult.questions.length} valid questions`);
+        } else {
+          console.error(`[Competitive Mock] Retry batch ${retry.batchIndex + 1} failed: ${retryResult.error || 'Unknown'}`);
+        }
+        if (attempt < failedBatches.length - 1) {
+          await delay(15000);
+        }
       }
     }
 
