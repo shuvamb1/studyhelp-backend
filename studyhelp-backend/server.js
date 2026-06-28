@@ -104,13 +104,11 @@ function delay(ms) {
 }
 
 // ========== GROQ API CALL (Competitive Mock) ==========
-async function callGroqMock(prompt, apiKey) {
+async function callGroqMock(prompt, apiKey, maxTokens = 4000) {
   if (!apiKey) {
     return { success: false, content: null };
   }
   try {
-    const maxTokens = 4000; // ~12-15 questions per batch without truncation
-
     const res = await fetch(`${AI_API_BASE}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -414,6 +412,88 @@ function cleanOptionText(opt) {
   return cleaned;
 }
 
+function fixInvalidEscapes(str) {
+  let result = '';
+  for (let i = 0; i < str.length; i++) {
+    if (str[i] === '\\' && i + 1 < str.length) {
+      const next = str[i + 1];
+      if (['"', '\\', '/', 'b', 'f', 'n', 'r', 't'].includes(next)) {
+        result += '\\' + next;
+        i++;
+      } else if (next === 'u') {
+        const hex = str.substring(i + 2, i + 6);
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+          result += '\\u' + hex;
+          i += 5;
+        } else {
+          result += '\\\\';
+        }
+      } else {
+        // Invalid escape (e.g., LaTeX \sum, \frac) — double the backslash
+        result += '\\\\' + next;
+        i++;
+      }
+    } else if (str[i] === '\\' && i + 1 >= str.length) {
+      // Trailing backslash
+      result += '\\\\';
+    } else {
+      result += str[i];
+    }
+  }
+  return result;
+}
+
+function extractValidObjects(str) {
+  const objects = [];
+  let inString = false;
+  let escapeNext = false;
+  let braceDepth = 0;
+  let objStart = -1;
+
+  for (let i = 0; i < str.length; i++) {
+    const char = str[i];
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      escapeNext = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (!inString) {
+      if (char === '{') {
+        if (braceDepth === 0) objStart = i;
+        braceDepth++;
+      } else if (char === '}') {
+        braceDepth--;
+        if (braceDepth === 0 && objStart >= 0) {
+          const objStr = str.substring(objStart, i + 1);
+          try {
+            objects.push(JSON.parse(objStr));
+          } catch (e) {
+            try {
+              objects.push(JSON.parse(fixInvalidEscapes(objStr)));
+            } catch (e2) {
+              // Object unrecoverable, skip
+            }
+          }
+          objStart = -1;
+        }
+      }
+    }
+  }
+
+  return objects;
+}
+
 function parseAIResponse(aiResponse, batch) {
   if (!aiResponse) return { questions: [], error: 'No AI response' };
 
@@ -443,6 +523,8 @@ function parseAIResponse(aiResponse, batch) {
   cleanedResponse = cleanedResponse.replace(/\u0000/g, '');
   // 3. Fix trailing commas before closing brackets
   cleanedResponse = cleanedResponse.replace(/,\s*([}\]])/g, '$1');
+  // 4. Fix missing commas between objects
+  cleanedResponse = cleanedResponse.replace(/}\s*{/g, '},{');
 
   let rawQuestions;
   try {
@@ -451,7 +533,24 @@ function parseAIResponse(aiResponse, batch) {
     console.error(`[Competitive Mock] JSON parse error: ${parseErr.message}`);
     console.error(`[Competitive Mock] Cleaned first 300 chars: ${cleanedResponse.substring(0, 300)}`);
     console.error(`[Competitive Mock] Cleaned last 300 chars: ${cleanedResponse.substring(cleanedResponse.length - 300)}`);
-    return { questions: [], error: 'JSON parse error: ' + parseErr.message };
+
+    // Try fixing invalid escape sequences (e.g., LaTeX \sum, \frac)
+    const fixedEscapes = fixInvalidEscapes(cleanedResponse);
+    try {
+      rawQuestions = JSON.parse(fixedEscapes);
+      console.log(`[Competitive Mock] Parsed successfully after fixing invalid escapes.`);
+    } catch (fixErr) {
+      console.error(`[Competitive Mock] Still failing after escape fix: ${fixErr.message}`);
+
+      // Fallback: extract individual objects from the malformed array
+      const extractedObjects = extractValidObjects(cleanedResponse);
+      if (extractedObjects.length > 0) {
+        console.log(`[Competitive Mock] Extracted ${extractedObjects.length} valid objects from malformed JSON.`);
+        rawQuestions = extractedObjects;
+      } else {
+        return { questions: [], error: 'JSON parse error: ' + parseErr.message };
+      }
+    }
   }
 
   if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
@@ -487,7 +586,7 @@ async function runBatchWithKey(config, batch, batchIndex, totalBatches, pyqText,
   const apiKey = AI_API_MOCK_KEYS[keyIndex];
   console.log(`[Competitive Mock] Batch ${batchIndex + 1}: ${batch.name} (${batch.count} questions) — using key ${keyIndex + 1}/${AI_API_MOCK_KEYS.length}`);
 
-  const result = await callGroqMock(prompt, apiKey);
+  const result = await callGroqMock(prompt, apiKey, Math.min(6000, 2000 + batch.count * 500));
 
   if (!result.success && result.retryAfter) {
     markKeyUsed(keyIndex); // cooldown the rate-limited key
