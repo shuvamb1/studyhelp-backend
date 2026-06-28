@@ -661,10 +661,11 @@ async function callAI(prompt) {
 
 // AI call for Competitive Mock Tests (uses one of the rotating API keys)
 async function callAIMock(prompt, apiKey) {
-  if (!aiMockEnabled || !apiKey) return null;
+  if (!aiMockEnabled || !apiKey) {
+    return { success: false, rateLimited: false, retryAfter: 0, error: 'No API key' };
+  }
   try {
-    // Each batch is ~15-20 questions, so 6000 tokens is plenty
-    const maxTokens = 6000;
+    const maxTokens = 4000; // Enough for ~15-20 questions per batch
 
     const res = await fetch(`${AI_API_BASE}/chat/completions`, {
       method: 'POST',
@@ -682,17 +683,40 @@ async function callAIMock(prompt, apiKey) {
         max_tokens: maxTokens
       })
     });
+
     if (!res.ok) {
       const errText = await res.text();
+      const errData = JSON.parse(errText);
+      
+      // Detect Groq rate limit
+      if (errData?.error?.code === 'rate_limit_exceeded') {
+        const msg = errData.error.message || '';
+        const retryMatch = msg.match(/try again in ([\d.]+)s/i);
+        const retryAfter = retryMatch ? parseFloat(retryMatch[1]) : 35;
+        console.log(`[Competitive Mock] Rate limited. Retry after ${retryAfter}s`);
+        return { success: false, rateLimited: true, retryAfter, content: null };
+      }
+      
       console.error('AI Mock API error:', errText);
-      return null;
+      return { success: false, rateLimited: false, retryAfter: 0, content: null };
     }
+    
     const data = await res.json();
-    return data.choices?.[0]?.message?.content || null;
+    return { 
+      success: true, 
+      rateLimited: false, 
+      retryAfter: 0, 
+      content: data.choices?.[0]?.message?.content || null 
+    };
   } catch (err) {
     console.error('AI Mock call failed:', err);
-    return null;
+    return { success: false, rateLimited: false, retryAfter: 0, content: null };
   }
+}
+
+// Delay helper
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // Extract text from PDF buffers
@@ -1088,10 +1112,25 @@ async function generateBatchWithRetry(config, batch, batchIndex, totalBatches, p
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const apiKey = getRandomMockKey();
-    console.log(`[Competitive Mock] Batch ${batchIndex + 1} attempt ${attempt + 1} (key ${Math.floor(Math.random() * AI_API_MOCK_KEYS.length) + 1}/${AI_API_MOCK_KEYS.length})`);
+    console.log(`[Competitive Mock] Batch ${batchIndex + 1} attempt ${attempt + 1}/${maxRetries + 1}`);
 
-    const aiResponse = await callAIMock(prompt, apiKey);
-    const result = parseAIResponse(aiResponse, batch);
+    const aiResult = await callAIMock(prompt, apiKey);
+    
+    // Rate limited — wait and retry
+    if (!aiResult.success && aiResult.rateLimited && aiResult.retryAfter > 0) {
+      const waitSeconds = Math.ceil(aiResult.retryAfter) + 2; // Add 2s buffer
+      console.log(`[Competitive Mock] Rate limited. Waiting ${waitSeconds}s before retry...`);
+      await delay(waitSeconds * 1000);
+      continue; // Retry with same attempt count (don't consume a retry)
+    }
+    
+    // Other failure
+    if (!aiResult.success || !aiResult.content) {
+      console.error(`[Competitive Mock] Batch ${batchIndex + 1} attempt ${attempt + 1} failed: API error`);
+      continue;
+    }
+
+    const result = parseAIResponse(aiResult.content, batch);
 
     if (result.questions.length > 0) {
       console.log(`[Competitive Mock] Batch ${batchIndex + 1}: ${result.questions.length} valid questions`);
@@ -1144,28 +1183,37 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       combinedSyllabusText = combinedSyllabusText.substring(0, MAX_CHARS) + '\n\n[Additional syllabus content truncated...]';
     }
 
-    console.log(`[Competitive Mock] Starting PARALLEL generation for ${config.examName} with ${AI_API_MOCK_KEYS.length} key(s). ${plan.batches.length} batches.`);
+    console.log(`[Competitive Mock] Starting SEQUENTIAL generation for ${config.examName} with ${AI_API_MOCK_KEYS.length} key(s). ${plan.batches.length} batches. ~${plan.batches.length * 40}s estimated.`);
     const startTime = Date.now();
 
-    // Run ALL batches in parallel using different API keys
-    const batchPromises = plan.batches.map((batch, i) =>
-      generateBatchWithRetry(config, batch, i, plan.batches.length, combinedPyqText, combinedSyllabusText, 2)
-    );
-
-    const batchResults = await Promise.all(batchPromises);
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[Competitive Mock] Parallel generation completed in ${elapsed}s`);
-
-    // Collect all successful questions
+    // Run batches SEQUENTIALLY with a delay between each to avoid rate limits
     const allQuestions = [];
     let failedBatches = 0;
-    for (const result of batchResults) {
+    const INTER_BATCH_DELAY_MS = 35000; // 35 seconds between batches to respect Groq's 12K TPM rate limit
+
+    for (let i = 0; i < plan.batches.length; i++) {
+      const batch = plan.batches[i];
+      console.log(`[Competitive Mock] Starting batch ${i + 1}/${plan.batches.length}: ${batch.name} (${batch.count} questions)`);
+
+      const result = await generateBatchWithRetry(config, batch, i, plan.batches.length, combinedPyqText, combinedSyllabusText, 2);
+
       if (result.success && result.questions.length > 0) {
         allQuestions.push(...result.questions);
+        console.log(`[Competitive Mock] Batch ${i + 1} complete. Total so far: ${allQuestions.length} questions.`);
       } else {
         failedBatches++;
+        console.error(`[Competitive Mock] Batch ${i + 1} failed after all retries.`);
+      }
+
+      // Wait between batches (except after the last one)
+      if (i < plan.batches.length - 1) {
+        console.log(`[Competitive Mock] Waiting ${INTER_BATCH_DELAY_MS / 1000}s before next batch...`);
+        await delay(INTER_BATCH_DELAY_MS);
       }
     }
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Competitive Mock] Sequential generation completed in ${elapsed}s`);
 
     if (allQuestions.length === 0) {
       return { success: false, error: 'All batches failed. No questions generated. Please check AI_API_MOCK keys and try again.' };
