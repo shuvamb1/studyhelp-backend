@@ -373,13 +373,14 @@ BATCH DETAILS:
 - ${batch.instructions}
 
 RULES:
-- MCQ only. Each question has exactly 4 options (A, B, C, D).
-- Correct answer: 0-based index (0=A, 1=B, 2=C, 3=D).
+- MCQ only. Each question has exactly 4 options.
+- Correct answer: 0-based index (0=first option, 1=second option, 2=third option, 3=fourth option).
 - At least one PLAUSIBLE DISTRACTOR (wrong option testing common mistakes).
 - Include detailed modelAnswer with step-by-step reasoning for every question.
 - Include difficulty (easy, medium, hard) and specific topic tag for each question.
 - Return ONLY a valid JSON array. NO markdown, NO code blocks, NO extra text.
 - CRITICAL: generate EXACTLY ${batch.count} questions. Not fewer.
+- CRITICAL: Do NOT include A, B, C, D labels, prefixes, or markers in the option text. Each option must be plain text only. Never return placeholder text like "A", "B", "C", "D" as option values.
 
 PYQ CONTENT (study pattern and difficulty):
 ${pyqText || 'No PYQ content provided.'}
@@ -391,7 +392,7 @@ JSON FORMAT (return ONLY this array):
 [
   {
     "question": "Question text",
-    "options": ["A", "B", "C", "D"],
+    "options": ["First option text", "Second option text", "Third option text", "Fourth option text"],
     "correctAnswer": 0,
     "modelAnswer": "Detailed explanation",
     "marks": 1,
@@ -400,6 +401,17 @@ JSON FORMAT (return ONLY this array):
     "type": "mcq"
   }
 ]`;
+}
+
+function cleanOptionText(opt) {
+  const text = String(opt).trim();
+  // Strip common option prefixes like "A)", "A.", "A:", "A -", "(A)", "A]", "A}", etc.
+  // Case-insensitive match for A-D followed by common separators.
+  const prefixPattern = /^(?:\(?[A-Da-d][)\].:\-]\s*|\[[A-Da-d]\]\s*|\{[A-Da-d]\}\s*)/;
+  let cleaned = text.replace(prefixPattern, '').trim();
+  // If the entire option is just a single letter A-D, treat as empty/invalid placeholder
+  if (/^[A-Da-d]$/.test(cleaned)) cleaned = '';
+  return cleaned;
 }
 
 function parseAIResponse(aiResponse, batch) {
@@ -451,9 +463,12 @@ function parseAIResponse(aiResponse, batch) {
     if (!q.question) continue;
     if (!Array.isArray(q.options) || q.options.length !== 4) continue;
     if (typeof q.correctAnswer !== 'number' || q.correctAnswer < 0 || q.correctAnswer > 3) continue;
+    const cleanedOptions = q.options.map(cleanOptionText);
+    // Reject if any option is empty after stripping labels (prevents placeholder "A","B","C","D")
+    if (cleanedOptions.some(o => o.length === 0)) continue;
     questions.push({
       question: q.question.trim(),
-      options: q.options.map(o => String(o).trim()),
+      options: cleanedOptions,
       correctAnswer: Math.round(q.correctAnswer),
       modelAnswer: q.modelAnswer || '',
       marks: Number(q.marks) || 1,
@@ -537,6 +552,7 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
 
     const allQuestions = [];
     const failedBatches = []; // stores { batchIndex, batch } for retry
+    const underfilledBatches = []; // stores { batchIndex, batch, originalCount } for retry
 
     // Process batches in rounds: up to 2 batches per round (one per key), with cooldown between rounds
     let batchIndex = 0;
@@ -577,6 +593,17 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
         const currentBatchIndex = batchIndex - results.length + i;
         if (result.success && result.questions.length > 0) {
           allQuestions.push(...result.questions);
+          // Track underfilled batches for retry
+          if (result.questions.length < currentBatch.count) {
+            const missing = currentBatch.count - result.questions.length;
+            underfilledBatches.push({
+              batchIndex: currentBatchIndex,
+              batch: { ...currentBatch, count: missing },
+              originalCount: currentBatch.count,
+              generatedCount: result.questions.length
+            });
+            console.log(`[Competitive Mock] Batch ${currentBatchIndex + 1} underfilled: ${result.questions.length}/${currentBatch.count}. Will retry for ${missing} more.`);
+          }
         } else {
           failedBatches.push({ batchIndex: currentBatchIndex, batch: currentBatch });
           console.error(`[Competitive Mock] Batch ${currentBatchIndex + 1} FAILED: ${result.error || 'Unknown error'}`);
@@ -607,10 +634,45 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
         if (retryResult.success && retryResult.questions.length > 0) {
           allQuestions.push(...retryResult.questions);
           console.log(`[Competitive Mock] Retry batch ${retry.batchIndex + 1}: ${retryResult.questions.length} valid questions`);
+          // Check if still underfilled after retry
+          if (retryResult.questions.length < retry.batch.count) {
+            const missing = retry.batch.count - retryResult.questions.length;
+            underfilledBatches.push({
+              batchIndex: retry.batchIndex,
+              batch: { ...retry.batch, count: missing },
+              originalCount: retry.batch.count,
+              generatedCount: retryResult.questions.length
+            });
+            console.log(`[Competitive Mock] Retry batch ${retry.batchIndex + 1} still underfilled: ${retryResult.questions.length}/${retry.batch.count}. Will retry for ${missing} more.`);
+          }
         } else {
           console.error(`[Competitive Mock] Retry batch ${retry.batchIndex + 1} failed: ${retryResult.error || 'Unknown'}`);
         }
         if (attempt < failedBatches.length - 1) {
+          await delay(15000);
+        }
+      }
+    }
+
+    // Retry underfilled batches after cooldown to generate missing questions on the exact same topic
+    if (underfilledBatches.length > 0) {
+      console.log(`[Competitive Mock] Retrying ${underfilledBatches.length} underfilled batch(es) for missing questions...`);
+      for (let attempt = 0; attempt < underfilledBatches.length; attempt++) {
+        const retry = underfilledBatches[attempt];
+        let availableKey = getAvailableKey();
+        if (availableKey < 0) {
+          await waitForAnyKey();
+          availableKey = getAvailableKey();
+          if (availableKey < 0) availableKey = 0;
+        }
+        const retryResult = await runBatchWithKey(config, retry.batch, retry.batchIndex, plan.batches.length, combinedPyqText, combinedSyllabusText, availableKey);
+        if (retryResult.success && retryResult.questions.length > 0) {
+          allQuestions.push(...retryResult.questions);
+          console.log(`[Competitive Mock] Underfill retry batch ${retry.batchIndex + 1}: ${retryResult.questions.length} valid questions (target was ${retry.batch.count})`);
+        } else {
+          console.error(`[Competitive Mock] Underfill retry batch ${retry.batchIndex + 1} failed: ${retryResult.error || 'Unknown'}`);
+        }
+        if (attempt < underfilledBatches.length - 1) {
           await delay(15000);
         }
       }
