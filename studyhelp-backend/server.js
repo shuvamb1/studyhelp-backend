@@ -109,7 +109,7 @@ async function callGroqMock(prompt, apiKey) {
     return { success: false, content: null };
   }
   try {
-    const maxTokens = 3000; // ~10-12 questions per batch at 12K TPM
+    const maxTokens = 4000; // ~12-15 questions per batch without truncation
 
     const res = await fetch(`${AI_API_BASE}/chat/completions`, {
       method: 'POST',
@@ -291,12 +291,15 @@ function getExamBatchPlan(examName) {
       totalMarks: 100,
       duration: 180,
       batches: [
-        { name: 'General Aptitude', count: 10, marks: 15, topics: 'Verbal Ability, Numerical Ability, Logical Reasoning', instructions: 'Generate 10 General Aptitude questions. First 5 = 1-mark each. Next 5 = 2-marks each. Total: 15 marks. NON-technical: tricky logical reasoning, pattern-based numerical, subtle verbal questions.' },
-        { name: 'Technical Part A', count: 12, marks: 20, topics: 'Technical Subject', instructions: 'Generate 12 technical questions. Mix: 7 of 1-mark + 5 of 2-mark. Total: ~20 marks. Cover first portion of syllabus.' },
-        { name: 'Technical Part B', count: 12, marks: 20, topics: 'Technical Subject', instructions: 'Generate 12 technical questions. Mix: 7 of 1-mark + 5 of 2-mark. Total: ~20 marks. Cover middle portion of syllabus.' },
-        { name: 'Technical Part C', count: 12, marks: 20, topics: 'Technical Subject', instructions: 'Generate 12 technical questions. Mix: 7 of 1-mark + 5 of 2-mark. Total: ~20 marks. Cover remaining syllabus.' },
-        { name: 'Technical Part D', count: 10, marks: 15, topics: 'Technical Subject', instructions: 'Generate 10 technical questions. Mix: 6 of 1-mark + 4 of 2-mark. Total: ~15 marks. Cover advanced topics.' },
-        { name: 'Technical Part E', count: 9, marks: 10, topics: 'Technical Subject', instructions: 'Generate 9 technical questions. Mix: 5 of 1-mark + 4 of 2-mark. Total: ~10 marks. Cover remaining topics.' }
+        { name: 'General Aptitude A', count: 5, marks: 8, topics: 'Verbal Ability, Numerical Ability, Logical Reasoning', instructions: 'Generate 5 General Aptitude questions. Mix: 3 of 1-mark + 2 of 2-mark. Total: ~8 marks. NON-technical: tricky logical reasoning, pattern-based numerical, subtle verbal questions.' },
+        { name: 'General Aptitude B', count: 5, marks: 7, topics: 'Verbal Ability, Numerical Ability, Logical Reasoning', instructions: 'Generate 5 General Aptitude questions. Mix: 2 of 1-mark + 3 of 2-mark. Total: ~7 marks. NON-technical.' },
+        { name: 'Technical Part A', count: 8, marks: 12, topics: 'Technical Subject', instructions: 'Generate 8 technical questions. Mix: 5 of 1-mark + 3 of 2-mark. Total: ~12 marks. Cover first portion of syllabus.' },
+        { name: 'Technical Part B', count: 8, marks: 12, topics: 'Technical Subject', instructions: 'Generate 8 technical questions. Mix: 5 of 1-mark + 3 of 2-mark. Total: ~12 marks. Cover next portion of syllabus.' },
+        { name: 'Technical Part C', count: 8, marks: 12, topics: 'Technical Subject', instructions: 'Generate 8 technical questions. Mix: 5 of 1-mark + 3 of 2-mark. Total: ~12 marks. Cover next portion of syllabus.' },
+        { name: 'Technical Part D', count: 8, marks: 12, topics: 'Technical Subject', instructions: 'Generate 8 technical questions. Mix: 5 of 1-mark + 3 of 2-mark. Total: ~12 marks. Cover next portion of syllabus.' },
+        { name: 'Technical Part E', count: 8, marks: 12, topics: 'Technical Subject', instructions: 'Generate 8 technical questions. Mix: 5 of 1-mark + 3 of 2-mark. Total: ~12 marks. Cover next portion of syllabus.' },
+        { name: 'Technical Part F', count: 8, marks: 12, topics: 'Technical Subject', instructions: 'Generate 8 technical questions. Mix: 5 of 1-mark + 3 of 2-mark. Total: ~12 marks. Cover next portion of syllabus.' },
+        { name: 'Technical Part G', count: 7, marks: 11, topics: 'Technical Subject', instructions: 'Generate 7 technical questions. Mix: 4 of 1-mark + 3 of 2-mark. Total: ~11 marks. Cover remaining advanced topics.' }
       ]
     },
     'NEET': {
@@ -456,7 +459,8 @@ async function runBatchWithKey(config, batch, batchIndex, totalBatches, pyqText,
   }
 
   if (!result.success || !result.content) {
-    return { success: false, error: 'API error' };
+    console.error(`[Competitive Mock] Batch ${batchIndex + 1} API call failed — no content returned`);
+    return { success: false, error: 'API error (no content)' };
   }
 
   const parsed = parseAIResponse(result.content, batch);
@@ -465,6 +469,7 @@ async function runBatchWithKey(config, batch, batchIndex, totalBatches, pyqText,
     return { success: true, questions: parsed.questions };
   }
 
+  console.error(`[Competitive Mock] Batch ${batchIndex + 1} parse failed: ${parsed.error || 'Unknown'}`);
   return { success: false, error: parsed.error || 'Parse error' };
 }
 
@@ -549,6 +554,7 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
           allQuestions.push(...result.questions);
         } else {
           failedBatches++;
+          console.error(`[Competitive Mock] Batch FAILED: ${result.error || 'Unknown error'}`);
         }
       }
 
