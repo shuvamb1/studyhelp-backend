@@ -71,8 +71,8 @@ if (AI_API_MOCK_KEYS.length === 0) {
 }
 const aiMockEnabled = AI_API_MOCK_KEYS.length > 0;
 
-// Separate model for competitive mock tests (recommend llama-3.1-8b-instant: 30K TPM free tier)
-const AI_MODEL_MOCK = process.env.AI_MODEL_MOCK || 'llama-3.1-8b-instant';
+// Hardcode model to llama-3.1-8b-instant (30K TPM) — avoid env var confusion
+const AI_MODEL_MOCK = 'llama-3.1-8b-instant';
 
 let keyIndex = 0;
 function getNextMockKey() {
@@ -686,7 +686,9 @@ async function callAIMock(prompt, apiKey) {
     return { success: false, rateLimited: false, retryAfter: 0, error: 'No API key' };
   }
   try {
-    const maxTokens = 2500; // Reduced to stay well within Groq's 12K TPM limit
+    const maxTokens = 5000; // Enough for ~15 questions per batch without truncation
+
+    console.log(`[Competitive Mock] Calling AI model: ${AI_MODEL_MOCK}, max_tokens: ${maxTokens}`);
 
     const res = await fetch(`${AI_API_BASE}/chat/completions`, {
       method: 'POST',
@@ -956,9 +958,10 @@ function getExamBatchPlan(examName) {
       duration: 180,
       batches: [
         { name: 'General Aptitude', count: 10, marks: 15, topics: 'Verbal Ability, Numerical Ability, Logical Reasoning', instructions: 'Generate 10 General Aptitude questions. First 5 questions should be 1-mark each. Next 5 questions should be 2-marks each. Total: 15 marks. These are NON-technical questions testing verbal ability, numerical ability, and logical reasoning.' },
-        { name: 'Technical Part A', count: 20, marks: 30, topics: 'Subject-specific technical topics from syllabus', instructions: 'Generate 20 technical subject questions. Mix of 1-mark and 2-mark questions. About 12 questions of 1-mark and 8 questions of 2-mark. Total: ~30 marks. Cover the first half of the syllabus topics evenly.' },
-        { name: 'Technical Part B', count: 20, marks: 30, topics: 'Subject-specific technical topics from syllabus', instructions: 'Generate 20 technical subject questions. Mix of 1-mark and 2-mark questions. About 12 questions of 1-mark and 8 questions of 2-mark. Total: ~30 marks. Cover the remaining half of the syllabus topics evenly.' },
-        { name: 'Technical Part C', count: 15, marks: 25, topics: 'Subject-specific technical topics from syllabus', instructions: 'Generate 15 technical subject questions. Mix of 1-mark and 2-mark questions. About 8 questions of 1-mark and 7 questions of 2-mark. Total: ~25 marks. Cover any remaining syllabus topics.' }
+        { name: 'Technical Part A', count: 15, marks: 25, topics: 'Subject-specific technical topics from syllabus', instructions: 'Generate 15 technical subject questions. Mix of 1-mark and 2-mark questions. About 9 questions of 1-mark and 6 questions of 2-mark. Total: ~25 marks. Cover the first portion of the syllabus topics evenly.' },
+        { name: 'Technical Part B', count: 15, marks: 25, topics: 'Subject-specific technical topics from syllabus', instructions: 'Generate 15 technical subject questions. Mix of 1-mark and 2-mark questions. About 9 questions of 1-mark and 6 questions of 2-mark. Total: ~25 marks. Cover the middle portion of the syllabus topics evenly.' },
+        { name: 'Technical Part C', count: 15, marks: 25, topics: 'Subject-specific technical topics from syllabus', instructions: 'Generate 15 technical subject questions. Mix of 1-mark and 2-mark questions. About 9 questions of 1-mark and 6 questions of 2-mark. Total: ~25 marks. Cover the remaining syllabus topics.' },
+        { name: 'Technical Part D', count: 10, marks: 10, topics: 'Subject-specific technical topics from syllabus', instructions: 'Generate 10 technical subject questions. Mix of 1-mark and 2-mark questions. About 6 questions of 1-mark and 4 questions of 2-mark. Total: ~10 marks. Cover any remaining or advanced topics.' }
       ]
     },
     'NEET': {
@@ -1213,7 +1216,7 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
     // Run batches SEQUENTIALLY with a delay between each to respect rate limits
     const allQuestions = [];
     let failedBatches = 0;
-    const INTER_BATCH_DELAY_MS = 15000; // 15 seconds between batches (for 30K TPM model)
+    const INTER_BATCH_DELAY_MS = 30000; // 30 seconds between batches (for 12K TPM limit: ~5800 tokens/request, 2 requests/min max)
 
     for (let i = 0; i < plan.batches.length; i++) {
       const batch = plan.batches[i];
