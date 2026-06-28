@@ -71,6 +71,9 @@ if (AI_API_MOCK_KEYS.length === 0) {
 }
 const aiMockEnabled = AI_API_MOCK_KEYS.length > 0;
 
+// Separate model for competitive mock tests (recommend llama-3.1-8b-instant: 30K TPM free tier)
+const AI_MODEL_MOCK = process.env.AI_MODEL_MOCK || 'llama-3.1-8b-instant';
+
 let keyIndex = 0;
 function getNextMockKey() {
   const key = AI_API_MOCK_KEYS[keyIndex % AI_API_MOCK_KEYS.length];
@@ -79,6 +82,24 @@ function getNextMockKey() {
 }
 function getRandomMockKey() {
   return AI_API_MOCK_KEYS[Math.floor(Math.random() * AI_API_MOCK_KEYS.length)];
+}
+
+// Global rate-limit tracker for competitive mock tests
+let nextSafeRequestTime = 0;
+function canMakeRequest() {
+  return Date.now() >= nextSafeRequestTime;
+}
+function recordRateLimit(retryAfterSeconds) {
+  nextSafeRequestTime = Date.now() + (retryAfterSeconds * 1000) + 2000; // +2s buffer
+  console.log(`[Competitive Mock] Global rate limit recorded. Next safe request at ${new Date(nextSafeRequestTime).toISOString()}`);
+}
+function waitForSafeRequest() {
+  const waitMs = nextSafeRequestTime - Date.now();
+  if (waitMs > 0) {
+    console.log(`[Competitive Mock] Waiting ${Math.ceil(waitMs / 1000)}s for global rate limit to clear...`);
+    return delay(waitMs);
+  }
+  return Promise.resolve();
 }
 
 mongoose.connect(process.env.MONGODB_URI)
@@ -665,7 +686,7 @@ async function callAIMock(prompt, apiKey) {
     return { success: false, rateLimited: false, retryAfter: 0, error: 'No API key' };
   }
   try {
-    const maxTokens = 4000; // Enough for ~15-20 questions per batch
+    const maxTokens = 2500; // Reduced to stay well within Groq's 12K TPM limit
 
     const res = await fetch(`${AI_API_BASE}/chat/completions`, {
       method: 'POST',
@@ -674,7 +695,7 @@ async function callAIMock(prompt, apiKey) {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: AI_MODEL,
+        model: AI_MODEL_MOCK,
         messages: [
           { role: 'system', content: 'You are an expert competitive exam question setter. You generate tough, exam-level questions for competitive examinations (NEET, JEE, GATE, WBJEE). You always respond with valid JSON only, no markdown, no explanations, no code blocks. You must generate the exact number of questions requested in the prompt.' },
           { role: 'user', content: prompt }
@@ -692,8 +713,9 @@ async function callAIMock(prompt, apiKey) {
       if (errData?.error?.code === 'rate_limit_exceeded') {
         const msg = errData.error.message || '';
         const retryMatch = msg.match(/try again in ([\d.]+)s/i);
-        const retryAfter = retryMatch ? parseFloat(retryMatch[1]) : 35;
+        const retryAfter = retryMatch ? parseFloat(retryMatch[1]) : 60;
         console.log(`[Competitive Mock] Rate limited. Retry after ${retryAfter}s`);
+        recordRateLimit(retryAfter);
         return { success: false, rateLimited: true, retryAfter, content: null };
       }
       
@@ -1107,21 +1129,23 @@ function parseAIResponse(aiResponse, batch) {
   return { questions, error: null };
 }
 
-async function generateBatchWithRetry(config, batch, batchIndex, totalBatches, pyqText, syllabusText, maxRetries = 2) {
+async function generateBatchWithRetry(config, batch, batchIndex, totalBatches, pyqText, syllabusText, maxRetries = 3) {
   const prompt = buildBatchPrompt(config.examName, batch, batchIndex, totalBatches, pyqText, syllabusText);
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Wait for global rate limit to clear before any attempt
+    await waitForSafeRequest();
+    
     const apiKey = getRandomMockKey();
     console.log(`[Competitive Mock] Batch ${batchIndex + 1} attempt ${attempt + 1}/${maxRetries + 1}`);
 
     const aiResult = await callAIMock(prompt, apiKey);
     
-    // Rate limited — wait and retry
-    if (!aiResult.success && aiResult.rateLimited && aiResult.retryAfter > 0) {
-      const waitSeconds = Math.ceil(aiResult.retryAfter) + 2; // Add 2s buffer
-      console.log(`[Competitive Mock] Rate limited. Waiting ${waitSeconds}s before retry...`);
-      await delay(waitSeconds * 1000);
-      continue; // Retry with same attempt count (don't consume a retry)
+    // Rate limited — the global tracker was already updated by callAIMock, 
+    // so the next loop iteration will wait automatically via waitForSafeRequest()
+    if (!aiResult.success && aiResult.rateLimited) {
+      console.log(`[Competitive Mock] Batch ${batchIndex + 1} rate limited. Will retry after global cooldown.`);
+      continue; // Loop again; waitForSafeRequest() will handle the delay
     }
     
     // Other failure
@@ -1173,23 +1197,23 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
       return { success: false, error: 'No PYQ or syllabus content found for this exam.' };
     }
 
-    const MAX_CHARS = 5000;
+    const MAX_CHARS = 1200;
     let combinedPyqText = pyqText;
     if (combinedPyqText.length > MAX_CHARS) {
-      combinedPyqText = combinedPyqText.substring(0, MAX_CHARS) + '\n\n[Additional PYQ content truncated...]';
+      combinedPyqText = combinedPyqText.substring(0, MAX_CHARS) + '\n\n[Truncated...]';
     }
     let combinedSyllabusText = syllabusText;
     if (combinedSyllabusText.length > MAX_CHARS) {
-      combinedSyllabusText = combinedSyllabusText.substring(0, MAX_CHARS) + '\n\n[Additional syllabus content truncated...]';
+      combinedSyllabusText = combinedSyllabusText.substring(0, MAX_CHARS) + '\n\n[Truncated...]';
     }
 
-    console.log(`[Competitive Mock] Starting SEQUENTIAL generation for ${config.examName} with ${AI_API_MOCK_KEYS.length} key(s). ${plan.batches.length} batches. ~${plan.batches.length * 40}s estimated.`);
+    console.log(`[Competitive Mock] Starting SEQUENTIAL generation for ${config.examName} with ${AI_API_MOCK_KEYS.length} key(s). Model: ${AI_MODEL_MOCK}. ${plan.batches.length} batches.`);
     const startTime = Date.now();
 
-    // Run batches SEQUENTIALLY with a delay between each to avoid rate limits
+    // Run batches SEQUENTIALLY with a delay between each to respect rate limits
     const allQuestions = [];
     let failedBatches = 0;
-    const INTER_BATCH_DELAY_MS = 35000; // 35 seconds between batches to respect Groq's 12K TPM rate limit
+    const INTER_BATCH_DELAY_MS = 15000; // 15 seconds between batches (for 30K TPM model)
 
     for (let i = 0; i < plan.batches.length; i++) {
       const batch = plan.batches[i];
@@ -2116,9 +2140,10 @@ app.get('/api/admin/ai-mock-status', authMiddleware, adminMiddleware, (req, res)
     aiMockEnabled,
     apiKeyCount: AI_API_MOCK_KEYS.length,
     apiBase: AI_API_BASE,
-    model: AI_MODEL,
+    model: AI_MODEL_MOCK,
+    fallbackModel: AI_MODEL,
     message: aiMockEnabled
-      ? `AI Mock API is configured with ${AI_API_MOCK_KEYS.length} key(s). Ready to generate competitive exam questions in parallel.`
+      ? `AI Mock API configured with ${AI_API_MOCK_KEYS.length} key(s). Model: ${AI_MODEL_MOCK}. Sequential generation with rate-limit protection enabled.`
       : 'No AI_API_MOCK1..10 keys configured. Set at least one AI_API_MOCK{N} environment variable.'
   });
 });
