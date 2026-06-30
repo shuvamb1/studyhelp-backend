@@ -225,6 +225,50 @@ const studentSchema = new mongoose.Schema({
 });
 const Student = mongoose.model('Student', studentSchema);
 
+// ========== MATERIALS SCHEMA ==========
+const materialSchema = new mongoose.Schema({
+  subject: String,
+  department: String,
+  semester: String,
+  title: String,
+  type: String,
+  url: String,
+  date: String
+});
+const Material = mongoose.model('Material', materialSchema);
+
+// ========== NOTICE SCHEMA ==========
+const noticeSchema = new mongoose.Schema({
+  message: String,
+  active: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now }
+});
+const Notice = mongoose.model('Notice', noticeSchema);
+
+// ========== MOCK TEST PAPER SCHEMA ==========
+const mockTestPaperSchema = new mongoose.Schema({
+  title: String,
+  subject: String,
+  department: String,
+  semester: String,
+  year: String,
+  marks: Number,
+  duration: Number,
+  pdfFiles: [{ filename: String, url: String }],
+  pdfUrl: String,
+  questions: [{
+    question: String,
+    options: [String],
+    correctAnswer: Number,
+    modelAnswer: String,
+    marks: Number,
+    difficulty: String,
+    type: { type: String, enum: ['mcq', 'descriptive'], default: 'mcq' }
+  }],
+  createdAt: { type: Date, default: Date.now }
+});
+const MockTestPaper = mongoose.model('MockTestPaper', mockTestPaperSchema);
+
 // ========== COMPETITIVE EXAM MOCK TEST SCHEMAS ==========
 
 const competitiveExamConfigSchema = new mongoose.Schema({
@@ -855,7 +899,99 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // ========== ROUTES ==========
 
-// ... existing routes remain the same ...
+// Seed materials from JSON on startup
+async function seedMaterials() {
+  try {
+    const count = await Material.countDocuments();
+    if (count === 0) {
+      const seedData = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'seed-materials.json'), 'utf-8'));
+      await Material.insertMany(seedData);
+      console.log(`Seeded ${seedData.length} materials`);
+    }
+  } catch (err) {
+    console.error('Seed error:', err.message);
+  }
+}
+seedMaterials();
+
+// GET /api/materials
+app.get('/api/materials', async (req, res) => {
+  try {
+    const materials = await Material.find().sort({ createdAt: -1 });
+    // Normalize semester values to match frontend filter expectations
+    const normalized = materials.map(m => ({
+      ...m.toObject(),
+      semester: m.semester?.replace(/^Sem\s+([IV]+)$/, (match, rom) => {
+        const map = { I: 'Semester I', II: 'Semester II', III: 'Semester III', IV: 'Semester IV', V: 'Semester V', VI: 'Semester VI' };
+        return map[rom] || match;
+      }) || m.semester
+    }));
+    res.json(normalized);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/notices/active
+app.get('/api/notices/active', async (req, res) => {
+  try {
+    const notice = await Notice.findOne({ active: true }).sort({ createdAt: -1 });
+    if (!notice) return res.status(404).json({ error: 'No active notice' });
+    res.json({ message: notice.message });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/user/profile
+app.get('/api/user/profile', authMiddleware, async (req, res) => {
+  try {
+    const student = await Student.findById(req.user.id);
+    if (!student) return res.status(404).json({ error: 'User not found' });
+    res.json({
+      id: student._id,
+      name: student.name,
+      roll: student.roll,
+      department: student.department,
+      year: student.year,
+      cin: student.cin,
+      downloadsCount: student.downloadsCount,
+      contributionsCount: student.contributionsCount,
+      role: student.role
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/download-track
+app.post('/api/download-track', authMiddleware, async (req, res) => {
+  try {
+    const student = await Student.findById(req.user.id);
+    if (student) {
+      student.downloadsCount = (student.downloadsCount || 0) + 1;
+      await student.save();
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/mock-tests/papers
+app.get('/api/mock-tests/papers', authMiddleware, async (req, res) => {
+  try {
+    const papers = await MockTestPaper.find().sort({ createdAt: -1 });
+    res.json(papers);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 // Admin: Get all competitive exam configs
 app.get('/api/admin/competitive-exams', authMiddleware, adminMiddleware, async (req, res) => {
