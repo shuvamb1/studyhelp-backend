@@ -1274,5 +1274,204 @@ app.get('/api/competitive-exams/:examName/results', authMiddleware, async (req, 
   }
 });
 
+// ========== ADMIN DASHBOARD ROUTES ==========
+
+app.get('/api/admin/metrics', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const totalDownloads = await Student.aggregate([{ $group: { _id: null, total: { $sum: '$downloadsCount' } } }]);
+    const totalContributions = await Student.aggregate([{ $group: { _id: null, total: { $sum: '$contributionsCount' } } }]);
+    const topContributors = await Student.find().sort({ contributionsCount: -1 }).limit(5).select('name department contributionsCount');
+    const topDownloader = await Student.findOne().sort({ downloadsCount: -1 }).select('name department downloadsCount');
+    res.json({
+      totalDownloads: totalDownloads[0]?.total || 0,
+      totalContributions: totalContributions[0]?.total || 0,
+      topContributors: topContributors.map(c => ({ name: c.name, department: c.department, contributionsCount: c.contributionsCount })),
+      topDownloader: topDownloader ? { name: topDownloader.name, department: topDownloader.department, downloadsCount: topDownloader.downloadsCount } : null,
+      demographics: null
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/demographics', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const deptBreakdown = await Student.aggregate([{ $group: { _id: '$department', count: { $sum: 1 } } }]);
+    const yearBreakdown = await Student.aggregate([{ $group: { _id: '$year', count: { $sum: 1 } } }]);
+    res.json({
+      departmentBreakdown: deptBreakdown.map(d => ({ department: d._id || 'Unknown', count: d.count })),
+      yearBreakdown: yearBreakdown.map(y => ({ year: y._id || 'Unknown', count: y.count })),
+      totalStudents: await Student.countDocuments()
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/mock-tests', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const papers = await MockTestPaper.find().sort({ createdAt: -1 });
+    res.json(papers);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/mock-tests', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { title, subject, department, semester, year } = req.body;
+    const paper = new MockTestPaper({ title, subject, department, semester, year });
+    await paper.save();
+    res.json({ success: true, message: 'Paper created', paper });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/mock-tests/papers', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { title, subject, department, semester, year } = req.body;
+    const paper = new MockTestPaper({ title, subject, department, semester, year });
+    await paper.save();
+    res.json({ success: true, message: 'Paper created', paper });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/admin/mock-tests/:id', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    await MockTestPaper.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/mock-tests/:paperId/pdfs', authMiddleware, adminMiddleware, upload.array('pdfs', 10), async (req, res) => {
+  try {
+    const paper = await MockTestPaper.findById(req.params.paperId);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+    if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No PDFs uploaded' });
+
+    const newFiles = [];
+    for (const file of req.files) {
+      const gridfsId = await uploadBufferToGridFS(file.buffer, file.originalname);
+      newFiles.push({ filename: file.originalname, url: `/uploads/${gridfsId}` });
+    }
+
+    paper.pdfFiles = paper.pdfFiles || [];
+    paper.pdfFiles.push(...newFiles);
+    await paper.save();
+    res.json({ message: `${req.files.length} PDF(s) uploaded`, pdfFiles: paper.pdfFiles });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/mock-tests/:paperId/syllabus', authMiddleware, adminMiddleware, upload.array('syllabus', 5), async (req, res) => {
+  try {
+    const paper = await MockTestPaper.findById(req.params.paperId);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+    if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No syllabus files uploaded' });
+
+    const newFiles = [];
+    for (const file of req.files) {
+      const gridfsId = await uploadBufferToGridFS(file.buffer, file.originalname);
+      newFiles.push({ filename: file.originalname, url: `/uploads/${gridfsId}` });
+    }
+
+    paper.syllabusFiles = paper.syllabusFiles || [];
+    paper.syllabusFiles.push(...newFiles);
+    await paper.save();
+    res.json({ message: `${req.files.length} syllabus file(s) uploaded`, syllabusFiles: paper.syllabusFiles });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/mock-tests/:paperId/questions', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const paper = await MockTestPaper.findById(req.params.paperId);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+    res.json({ questions: paper.questions || [] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/materials', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const materials = await Material.find().sort({ createdAt: -1 });
+    res.json(materials);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/materials/:id', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const material = await Material.findById(req.params.id);
+    if (!material) return res.status(404).json({ error: 'Material not found' });
+    res.json(material);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/notices', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const notices = await Notice.find().sort({ createdAt: -1 });
+    res.json(notices);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/notices', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ error: 'Message is required' });
+    await Notice.updateMany({}, { active: false });
+    const notice = new Notice({ message, active: true });
+    await notice.save();
+    res.json({ success: true, notice });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/contributions/pending', authMiddleware, adminMiddleware, async (req, res) => {
+  // Return empty for now - contributions system not fully implemented
+  res.json([]);
+});
+
+app.post('/api/admin/contributions/:id/approve', authMiddleware, adminMiddleware, async (req, res) => {
+  res.json({ success: true, message: 'Not implemented yet' });
+});
+
+app.get('/api/admin/ai-status', authMiddleware, adminMiddleware, (req, res) => {
+  res.json({
+    aiEnabled,
+    aiMockEnabled,
+    model: AI_MODEL,
+    base: AI_API_BASE,
+    groqKeys: AI_API_MOCK_KEYS.length
+  });
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
