@@ -222,7 +222,7 @@ const studentSchema = new mongoose.Schema({
   downloadsCount: { type: Number, default: 0 },
   contributionsCount: { type: Number, default: 0 },
   role: { type: String, default: 'user' }
-});
+}, { strict: false, collection: 'students' });
 const Student = mongoose.model('Student', studentSchema);
 
 // ========== MATERIALS SCHEMA ==========
@@ -234,7 +234,7 @@ const materialSchema = new mongoose.Schema({
   type: String,
   url: String,
   date: String
-});
+}, { strict: false, collection: 'materials' });
 const Material = mongoose.model('Material', materialSchema);
 
 // ========== NOTICE SCHEMA ==========
@@ -242,7 +242,7 @@ const noticeSchema = new mongoose.Schema({
   message: String,
   active: { type: Boolean, default: true },
   createdAt: { type: Date, default: Date.now }
-});
+}, { strict: false, collection: 'notices' });
 const Notice = mongoose.model('Notice', noticeSchema);
 
 // ========== MOCK TEST PAPER SCHEMA ==========
@@ -254,7 +254,7 @@ const mockTestPaperSchema = new mongoose.Schema({
   year: String,
   marks: Number,
   duration: Number,
-  pdfFiles: [{ filename: String, url: String }],
+  pdfFiles: [{ filename: String, url: String, gridfsId: mongoose.Schema.Types.ObjectId }],
   pdfUrl: String,
   questions: [{
     question: String,
@@ -266,10 +266,37 @@ const mockTestPaperSchema = new mongoose.Schema({
     type: { type: String, enum: ['mcq', 'descriptive'], default: 'mcq' }
   }],
   createdAt: { type: Date, default: Date.now }
-});
+}, { strict: false, collection: 'mocktestpapers' });
 const MockTestPaper = mongoose.model('MockTestPaper', mockTestPaperSchema);
 
-// ========== COMPETITIVE EXAM MOCK TEST SCHEMAS ==========
+// ========== COMPETITIVE TEST RESULTS SCHEMA ==========
+const competitiveTestResultSchema = new mongoose.Schema({
+  userId: String,
+  examName: String,
+  answers: [{ questionId: { type: mongoose.Schema.Types.Mixed }, selectedOption: Number, textAnswer: String, fileId: String, fileName: String }],
+  score: Number,
+  totalMarks: Number,
+  correctCount: Number,
+  wrongCount: Number,
+  unansweredCount: Number,
+  timeTaken: Number,
+  completedAt: { type: Date, default: Date.now }
+}, { strict: false, collection: 'competitivetestresults' });
+const CompetitiveTestResult = mongoose.model('CompetitiveTestResult', competitiveTestResultSchema);
+
+// ========== MOCK TEST RESULTS SCHEMA ==========
+const mockTestResultSchema = new mongoose.Schema({
+  userId: String,
+  paperId: String,
+  score: Number,
+  totalMarks: Number,
+  correctCount: Number,
+  wrongCount: Number,
+  unansweredCount: Number,
+  timeTaken: Number,
+  completedAt: { type: Date, default: Date.now }
+}, { strict: false, collection: 'mocktestresults' });
+const MockTestResult = mongoose.model('MockTestResult', mockTestResultSchema);
 
 const competitiveExamConfigSchema = new mongoose.Schema({
   examName: { type: String, enum: ['NEET', 'JEE', 'GATE', 'WBJEE'], required: true, unique: true },
@@ -293,7 +320,7 @@ const competitiveExamConfigSchema = new mongoose.Schema({
   status: { type: String, default: 'active' },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
-});
+}, { strict: false, collection: 'competitiveexamconfigs' });
 const CompetitiveExamConfig = mongoose.model('CompetitiveExamConfig', competitiveExamConfigSchema);
 
 const competitiveTestSessionSchema = new mongoose.Schema({
@@ -314,20 +341,6 @@ const competitiveTestSessionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, expires: 7200 }
 });
 const CompetitiveTestSession = mongoose.model('CompetitiveTestSession', competitiveTestSessionSchema);
-
-const competitiveTestResultSchema = new mongoose.Schema({
-  userId: String,
-  examName: String,
-  answers: [{ questionId: { type: mongoose.Schema.Types.Mixed }, selectedOption: Number, textAnswer: String, fileId: String, fileName: String }],
-  score: Number,
-  totalMarks: Number,
-  correctCount: Number,
-  wrongCount: Number,
-  unansweredCount: Number,
-  timeTaken: Number,
-  completedAt: { type: Date, default: Date.now }
-});
-const CompetitiveTestResult = mongoose.model('CompetitiveTestResult', competitiveTestResultSchema);
 
 // ========== EXAM BATCH PLANS ==========
 
@@ -993,6 +1006,42 @@ app.get('/api/mock-tests/papers', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/mock-tests/papers/:id
+app.get('/api/mock-tests/papers/:id', authMiddleware, async (req, res) => {
+  try {
+    const paper = await MockTestPaper.findById(req.params.id);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+    res.json(paper);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/mock-tests/results (supports ?paperId= query param)
+app.get('/api/mock-tests/results', authMiddleware, async (req, res) => {
+  try {
+    const query = { userId: req.user.id };
+    if (req.query.paperId) query.paperId = req.query.paperId;
+    const results = await MockTestResult.find(query).sort({ completedAt: -1 });
+    res.json(results);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/mock-tests/results/:paperId
+app.get('/api/mock-tests/results/:paperId', authMiddleware, async (req, res) => {
+  try {
+    const results = await MockTestResult.find({ userId: req.user.id, paperId: req.params.paperId }).sort({ completedAt: -1 });
+    res.json(results);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Admin: Get all competitive exam configs
 app.get('/api/admin/competitive-exams', authMiddleware, adminMiddleware, async (req, res) => {
   try {
@@ -1130,7 +1179,9 @@ app.get('/api/admin/ai-mock-status', authMiddleware, adminMiddleware, (req, res)
 // User: List available competitive exams
 app.get('/api/competitive-exams', authMiddleware, async (req, res) => {
   try {
-    const configs = await CompetitiveExamConfig.find({ status: 'active' }).select('-__v').sort({ examName: 1 });
+    const configs = await CompetitiveExamConfig.find({
+      $or: [{ status: 'active' }, { status: { $exists: false } }]
+    }).select('-__v').sort({ examName: 1 });
     res.json(configs);
   } catch (err) {
     console.error(err);
@@ -1464,6 +1515,17 @@ app.post('/api/admin/contributions/:id/approve', authMiddleware, adminMiddleware
 });
 
 app.get('/api/admin/ai-status', authMiddleware, adminMiddleware, (req, res) => {
+  res.json({
+    aiEnabled,
+    aiMockEnabled,
+    model: AI_MODEL,
+    base: AI_API_BASE,
+    groqKeys: AI_API_MOCK_KEYS.length
+  });
+});
+
+// Alias for frontend compatibility
+app.get('/api/admin/ai-mock-status', authMiddleware, adminMiddleware, (req, res) => {
   res.json({
     aiEnabled,
     aiMockEnabled,
