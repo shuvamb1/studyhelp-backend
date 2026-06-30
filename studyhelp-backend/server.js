@@ -910,6 +910,60 @@ async function deleteFromGridFS(gridfsId) {
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// ========== AUTH ROUTES ==========
+
+// POST /register
+app.post('/register', async (req, res) => {
+  try {
+    const { name, cin, roll, year, department } = req.body;
+    if (!name || !cin || !roll || !year || !department) {
+      return res.status(400).send('All fields are required');
+    }
+    const existing = await Student.findOne({ cin });
+    if (existing) return res.status(400).send('CIN already registered');
+    const student = new Student({ name, cin, roll, year, department });
+    await student.save();
+    const token = jwt.sign({ id: student._id, cin: student.cin, role: student.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: student._id, name: student.name, cin: student.cin, role: student.role } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Server error');
+  }
+});
+
+// POST /login
+app.post('/login', async (req, res) => {
+  try {
+    const { name, cin } = req.body;
+    if (!name || !cin) return res.status(400).send('Name and CIN required');
+    const student = await Student.findOne({ name, cin });
+    if (!student) return res.status(401).send('Invalid credentials');
+    const token = jwt.sign({ id: student._id, cin: student.cin, role: student.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: student._id, name: student.name, cin: student.cin, role: student.role } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Server error');
+  }
+});
+
+// POST /admin-login
+app.post('/admin-login', async (req, res) => {
+  try {
+    const { name, cin, password } = req.body;
+    if (!name || !cin || !password) return res.status(400).send('All fields required');
+    const student = await Student.findOne({ name, cin });
+    if (!student) return res.status(401).send('Invalid credentials');
+    if (password !== process.env.ADMIN_PASSWORD) return res.status(401).send('Invalid admin password');
+    student.role = 'admin';
+    await student.save();
+    const token = jwt.sign({ id: student._id, cin: student.cin, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: student._id, name: student.name, cin: student.cin, role: 'admin' } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Server error');
+  }
+});
+
 // ========== ROUTES ==========
 
 // Seed materials from JSON on startup
