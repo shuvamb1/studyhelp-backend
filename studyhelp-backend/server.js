@@ -71,6 +71,7 @@ const aiMockEnabled = AI_API_MOCK_KEYS.length > 0;
 const MOCKS_PER_KEY = 2;          // how many requests per key before cooldown
 const KEY_COOLDOWN_MS = 60000;    // 60s between uses of the same key
 const PAUSE_BETWEEN_ROUNDS_MS = 60000; // 60s pause between parallel rounds (matches key cooldown to let TPM fully reset)
+const RETRY_COOLDOWN_MS = 60000;  // 60s cooling time after each retrying batch
 
 // Track per-key cooldown to respect each account's rate limit
 const keyCooldowns = AI_API_MOCK_KEYS.map(() => 0);
@@ -818,7 +819,7 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
           console.error(`[Competitive Mock] Retry batch ${retry.batchIndex + 1} failed: ${retryResult.error || 'Unknown'}`);
         }
         if (attempt < failedBatches.length - 1) {
-          await delay(15000);
+          await delay(RETRY_COOLDOWN_MS);
         }
       }
     }
@@ -842,7 +843,7 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
           console.error(`[Competitive Mock] Underfill retry batch ${retry.batchIndex + 1} failed: ${retryResult.error || 'Unknown'}`);
         }
         if (attempt < underfilledBatches.length - 1) {
-          await delay(15000);
+          await delay(RETRY_COOLDOWN_MS);
         }
       }
     }
@@ -951,9 +952,13 @@ app.post('/admin-login', async (req, res) => {
   try {
     const { name, cin, password } = req.body;
     if (!name || !cin || !password) return res.status(400).send('All fields required');
-    const student = await Student.findOne({ name, cin });
-    if (!student) return res.status(401).send('Invalid credentials');
-    if (password !== process.env.ADMIN_PASSWORD) return res.status(401).send('Invalid admin password');
+    const student = await Student.findOne({ name: name.trim(), cin: cin.trim() });
+    if (!student) return res.status(401).send('Student not found. Please register first.');
+    const adminPassword = (process.env.ADMIN_PASSWORD || '').trim();
+    if (password.trim() !== adminPassword) {
+      console.log(`[Admin Login] Wrong password for ${name}. Expected: "${adminPassword}" (length ${adminPassword.length}), Got: "${password.trim()}" (length ${password.trim().length})`);
+      return res.status(401).send('Invalid admin password');
+    }
     student.role = 'admin';
     await student.save();
     const token = jwt.sign({ id: student._id, cin: student.cin, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '7d' });
