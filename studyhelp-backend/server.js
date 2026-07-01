@@ -299,6 +299,25 @@ const mockTestResultSchema = new mongoose.Schema({
 }, { strict: false, collection: 'mocktestresults' });
 const MockTestResult = mongoose.model('MockTestResult', mockTestResultSchema);
 
+// ========== REGULAR MOCK TEST SESSION SCHEMA ==========
+const testSessionSchema = new mongoose.Schema({
+  paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper', required: true },
+  userId: String,
+  questions: [{
+    question: String,
+    options: [String],
+    correctAnswer: Number,
+    modelAnswer: String,
+    marks: Number,
+    difficulty: String,
+    type: { type: String, enum: ['mcq', 'descriptive'], default: 'mcq' }
+  }],
+  totalMarks: Number,
+  duration: Number,
+  createdAt: { type: Date, default: Date.now, expires: 7200 }
+});
+const TestSession = mongoose.model('TestSession', testSessionSchema);
+
 const competitiveExamConfigSchema = new mongoose.Schema({
   examName: { type: String, enum: ['NEET', 'JEE', 'GATE', 'WBJEE'], required: true, unique: true },
   displayName: String,
@@ -1126,6 +1145,214 @@ app.get('/api/mock-tests/:paperId/previous-result', authMiddleware, async (req, 
   } catch (err) {
     console.error('Previous result fetch error:', err);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/mock-tests/:paperId/start — generate AI questions for a regular mock test
+app.post('/api/mock-tests/:paperId/start', authMiddleware, async (req, res) => {
+  try {
+    const { paperId } = req.params;
+    const { marks, duration, questionType, targetDifficulty } = req.body;
+    const totalMarks = Number(marks) || 30;
+    const testDuration = Number(duration) || 60;
+    const qType = questionType || 'mcq';
+
+    const paper = await MockTestPaper.findById(paperId);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+
+    // Extract text from PDFs
+    let pdfText = '';
+    if (paper.pdfFiles && paper.pdfFiles.length > 0) {
+      const texts = await extractTextFromFileObjects(paper.pdfFiles);
+      pdfText = texts.join('\n\n---\n\n');
+    } else if (paper.pdfUrl) {
+      try {
+        const pdfRes = await fetch(paper.pdfUrl);
+        if (pdfRes.ok) {
+          const buffer = Buffer.from(await pdfRes.arrayBuffer());
+          const pdfData = await pdfParse(buffer);
+          pdfText = pdfData.text || '';
+        }
+      } catch (e) {
+        console.error('PDF fetch error:', e.message);
+      }
+    }
+
+    if (!pdfText) {
+      return res.status(400).json({ error: 'No PDF content available for this paper.' });
+    }
+
+    const MAX_CHARS = 2000;
+    let truncatedText = pdfText;
+    if (truncatedText.length > MAX_CHARS) truncatedText = truncatedText.substring(0, MAX_CHARS) + '\n\n[Truncated...]';
+
+    // Build prompt
+    const diff = targetDifficulty || 'medium';
+    let qTypeInstruction = '';
+    if (qType === 'mcq') {
+      qTypeInstruction = 'Generate ONLY MCQ questions. Each question has exactly 4 options and one correct answer (0-based index).';
+    } else if (qType === 'descriptive') {
+      qTypeInstruction = 'Generate ONLY descriptive questions. No options needed. Provide a model answer for each question.';
+    } else {
+      qTypeInstruction = 'Generate a MIX of questions. For MCQ questions, provide exactly 4 options and a correct answer (0-based index). For descriptive questions, provide a model answer and no options.';
+    }
+
+    const prompt = `You are an expert exam question setter. Based on the following PYQ content, generate a mock test with questions worth a total of ${totalMarks} marks. The test duration is ${testDuration} minutes.
+
+${qTypeInstruction}
+
+DIFFICULTY: ${diff}
+
+PYQ CONTENT (study pattern and difficulty):
+${truncatedText}
+
+RULES:
+- Return a VALID JSON ARRAY of questions. Each question is an object.
+- MCQ format: { "question": "...", "options": ["A", "B", "C", "D"], "correctAnswer": 0, "marks": 1, "difficulty": "easy|medium|hard", "type": "mcq" }
+- Descriptive format: { "question": "...", "modelAnswer": "...", "marks": 1, "difficulty": "easy|medium|hard", "type": "descriptive" }
+- Options must not be empty. No placeholder letters like "A", "B", "C", "D" as options.
+- Correct answer for MCQ is 0-based index (0=first option, 1=second, etc.).
+- Generate questions whose total marks add up to approximately ${totalMarks}.
+- Return ONLY the JSON array. No markdown, no code blocks, no extra text.`;
+
+    // Call Groq API (use regular AI key, fallback to mock key)
+    const apiKey = AI_API_KEY || (AI_API_MOCK_KEYS.length > 0 ? AI_API_MOCK_KEYS[0] : '');
+    if (!apiKey) return res.status(400).json({ error: 'AI is not configured. Please contact admin.' });
+
+    const result = await callGroqMock(prompt, apiKey, 4000);
+    if (!result.success || !result.content) {
+      return res.status(500).json({ error: 'AI question generation failed. Please try again.' });
+    }
+
+    const parsed = parseAIResponse(result.content, { count: 999, marks: 1 });
+    if (!parsed.questions || parsed.questions.length === 0) {
+      return res.status(500).json({ error: 'No valid questions were generated. Please try again.' });
+    }
+
+    let actualTotalMarks = 0;
+    for (const q of parsed.questions) {
+      actualTotalMarks += q.marks || 1;
+    }
+
+    const session = new TestSession({
+      paperId,
+      userId: req.user.id,
+      questions: parsed.questions,
+      totalMarks: actualTotalMarks,
+      duration: testDuration
+    });
+    await session.save();
+
+    const clientQuestions = parsed.questions.map((q, idx) => ({
+      id: idx,
+      question: q.question,
+      options: q.options || [],
+      marks: q.marks || 1,
+      difficulty: q.difficulty || 'medium',
+      type: q.type || 'mcq',
+      modelAnswer: q.modelAnswer || ''
+    }));
+
+    res.json({
+      testId: session._id,
+      paper: {
+        title: paper.title,
+        subject: paper.subject || '',
+        department: paper.department || '',
+        semester: paper.semester || ''
+      },
+      questions: clientQuestions,
+      totalMarks: actualTotalMarks,
+      duration: testDuration
+    });
+  } catch (err) {
+    console.error('Start mock test error:', err);
+    res.status(500).json({ error: 'Server error during test generation' });
+  }
+});
+
+// POST /api/mock-tests/:paperId/submit — submit answers for a regular mock test
+app.post('/api/mock-tests/:paperId/submit', authMiddleware, async (req, res) => {
+  try {
+    const { paperId } = req.params;
+    const { testId, answers, timeTaken } = req.body;
+    if (!testId) return res.status(400).json({ error: 'Test ID required' });
+
+    const session = await TestSession.findById(testId);
+    if (!session) return res.status(400).json({ error: 'Test session expired. Please start a new test.' });
+
+    const questions = session.questions;
+    const userAnswers = answers || [];
+
+    let score = 0, correct = 0, wrong = 0, unanswered = 0;
+    const answerMap = {};
+    userAnswers.forEach(a => { answerMap[a.questionId] = a; });
+
+    const detailedResults = questions.map((q, idx) => {
+      const userAnswer = answerMap[idx];
+      const selected = userAnswer ? userAnswer.selectedOption : undefined;
+      const isCorrect = selected === q.correctAnswer;
+      const isUnanswered = selected === undefined || selected === null;
+
+      if (q.type === 'descriptive') {
+        return {
+          questionId: idx,
+          question: q.question,
+          type: 'descriptive',
+          marks: q.marks || 1,
+          textAnswer: userAnswer ? (userAnswer.textAnswer || '') : '',
+          fileId: userAnswer ? (userAnswer.fileId || '') : '',
+          fileName: userAnswer ? (userAnswer.fileName || '') : '',
+          modelAnswer: q.modelAnswer || '',
+          isCorrect: null
+        };
+      }
+
+      if (isCorrect) { score += q.marks; correct++; }
+      else if (isUnanswered) { unanswered++; }
+      else { wrong++; }
+
+      return {
+        questionId: idx,
+        question: q.question,
+        options: q.options || [],
+        correctAnswer: q.correctAnswer,
+        selectedOption: selected,
+        isCorrect,
+        marks: q.marks || 1,
+        type: 'mcq'
+      };
+    });
+
+    const result = new MockTestResult({
+      userId: req.user.id,
+      paperId,
+      score,
+      totalMarks: session.totalMarks,
+      correctCount: correct,
+      wrongCount: wrong,
+      unansweredCount: unanswered,
+      timeTaken: Number(timeTaken) || 0
+    });
+    await result.save();
+
+    await TestSession.findByIdAndDelete(testId);
+
+    const percentage = session.totalMarks > 0 ? ((score / session.totalMarks) * 100).toFixed(2) : '0.00';
+
+    res.json({
+      score,
+      totalMarks: session.totalMarks,
+      percentage,
+      correctCount: correct,
+      wrongCount: wrong,
+      unansweredCount: unanswered,
+      timeTaken: Number(timeTaken) || 0,
+      detailedResults
+    });
+  } catch (err) {
+    console.error('Submit mock test error:', err);
+    res.status(500).json({ error: 'Server error during submission' });
   }
 });
 
