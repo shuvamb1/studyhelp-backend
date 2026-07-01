@@ -643,6 +643,13 @@ function parseAIResponse(aiResponse, batch) {
   return { questions, error: null };
 }
 
+function getTargetDifficulty(percentage) {
+  if (percentage < 40) return 'easy';
+  if (percentage < 60) return 'medium';
+  if (percentage < 75) return 'medium-hard';
+  return 'hard';
+}
+
 // Run one batch using a specific key
 async function runBatchWithKey(config, batch, batchIndex, totalBatches, pyqText, syllabusText, keyIndex) {
   const prompt = buildBatchPrompt(config.examName, batch, batchIndex, totalBatches, pyqText, syllabusText);
@@ -1097,6 +1104,27 @@ app.get('/api/mock-tests/results/:paperId', authMiddleware, async (req, res) => 
     res.json(results);
   } catch (err) {
     console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/mock-tests/:paperId/previous-result — fetch last result for adaptive difficulty
+app.get('/api/mock-tests/:paperId/previous-result', authMiddleware, async (req, res) => {
+  try {
+    const result = await MockTestResult.findOne({ userId: req.user.id, paperId: req.params.paperId }).sort({ completedAt: -1 });
+    if (!result) {
+      return res.json({ hasPreviousResult: false });
+    }
+    const percentage = result.totalMarks > 0 ? Math.round((result.score / result.totalMarks) * 100) : 0;
+    res.json({
+      hasPreviousResult: true,
+      score: result.score,
+      totalMarks: result.totalMarks,
+      percentage: percentage,
+      targetDifficulty: getTargetDifficulty(percentage)
+    });
+  } catch (err) {
+    console.error('Previous result fetch error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
