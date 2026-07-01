@@ -1197,7 +1197,7 @@ app.post('/api/mock-tests/:paperId/start', authMiddleware, async (req, res) => {
       qTypeInstruction = 'Generate a MIX of questions. For MCQ questions, provide exactly 4 options and a correct answer (0-based index). For descriptive questions, provide a model answer and no options.';
     }
 
-    const prompt = `You are an expert exam question setter. Based on the following PYQ content, generate a mock test with questions worth a total of ${totalMarks} marks. The test duration is ${testDuration} minutes.
+    const prompt = `You are an experienced exam question setter. Analyzing the PYQ questions(In exam , questions like PYQ questions are generally given), generate a mock test with questions worth a total of ${totalMarks} marks. The test duration is ${testDuration} minutes.
 
 ${qTypeInstruction}
 
