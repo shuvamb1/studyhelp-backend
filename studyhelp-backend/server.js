@@ -1160,7 +1160,7 @@ app.post('/api/mock-tests/:paperId/start', authMiddleware, async (req, res) => {
     const paper = await MockTestPaper.findById(paperId);
     if (!paper) return res.status(404).json({ error: 'Paper not found' });
 
-    // Extract text from PDFs
+    // Extract text from PYQ PDFs
     let pdfText = '';
     if (paper.pdfFiles && paper.pdfFiles.length > 0) {
       const texts = await extractTextFromFileObjects(paper.pdfFiles);
@@ -1178,13 +1178,22 @@ app.post('/api/mock-tests/:paperId/start', authMiddleware, async (req, res) => {
       }
     }
 
-    if (!pdfText) {
-      return res.status(400).json({ error: 'No PDF content available for this paper.' });
+    // Extract text from syllabus PDFs
+    let syllabusText = '';
+    if (paper.syllabusFiles && paper.syllabusFiles.length > 0) {
+      const texts = await extractTextFromFileObjects(paper.syllabusFiles);
+      syllabusText = texts.join('\n\n---\n\n');
+    }
+
+    if (!pdfText && !syllabusText) {
+      return res.status(400).json({ error: 'No PDF or syllabus content available for this paper.' });
     }
 
     const MAX_CHARS = 2000;
-    let truncatedText = pdfText;
-    if (truncatedText.length > MAX_CHARS) truncatedText = truncatedText.substring(0, MAX_CHARS) + '\n\n[Truncated...]';
+    let truncatedPyqText = pdfText;
+    if (truncatedPyqText.length > MAX_CHARS) truncatedPyqText = truncatedPyqText.substring(0, MAX_CHARS) + '\n\n[Truncated...]';
+    let truncatedSyllabusText = syllabusText;
+    if (truncatedSyllabusText.length > MAX_CHARS) truncatedSyllabusText = truncatedSyllabusText.substring(0, MAX_CHARS) + '\n\n[Truncated...]';
 
     // Build prompt
     const diff = targetDifficulty || 'medium';
@@ -1197,16 +1206,15 @@ app.post('/api/mock-tests/:paperId/start', authMiddleware, async (req, res) => {
       qTypeInstruction = 'Generate a MIX of questions. For MCQ questions, provide exactly 4 options and a correct answer (0-based index). For descriptive questions, provide a model answer and no options.';
     }
 
-    const prompt = `You are an experienced exam question setter. Analyzing the PYQ questions(In exam , questions like PYQ questions are generally given), generate a mock test with questions worth a total of ${totalMarks} marks. The test duration is ${testDuration} minutes.
+    const prompt = `You are an experienced exam question setter. Based on the following PYQ questions and syllabus, generate a mock test with questions worth a total of ${totalMarks} marks. The test duration is ${testDuration} minutes.
 
 ${qTypeInstruction}
 
 DIFFICULTY: ${diff}
 
-PYQ CONTENT (study pattern and difficulty):
-${truncatedText}
-
-RULES:
+${truncatedPyqText ? `PYQ CONTENT (study pattern, question style, and difficulty):\n${truncatedPyqText}\n\n` : ''}${truncatedSyllabusText ? `SYLLABUS CONTENT (strictly follow these topics — generate questions ONLY from topics covered in the syllabus):\n${truncatedSyllabusText}\n\n` : ''}RULES:
+- ALL questions MUST be based on topics from the syllabus. Do NOT generate questions on topics outside the syllabus.
+- Study the PYQ pattern to match the style and difficulty of real exam questions.
 - Return a VALID JSON ARRAY of questions. Each question is an object.
 - MCQ format: { "question": "...", "options": ["A", "B", "C", "D"], "correctAnswer": 0, "marks": 1, "difficulty": "easy|medium|hard", "type": "mcq" }
 - Descriptive format: { "question": "...", "modelAnswer": "...", "marks": 1, "difficulty": "easy|medium|hard", "type": "descriptive" }
