@@ -393,10 +393,10 @@ function getExamBatchPlan(examName) {
         { name: 'Chemistry Part A', count: 15, marks: 60, topics: 'Chemistry', instructions: '15 Chemistry questions. Each 4 marks. Total: 60. Physical chemistry.' },
         { name: 'Chemistry Part B', count: 15, marks: 60, topics: 'Chemistry', instructions: '15 Chemistry questions. Each 4 marks. Total: 60. Organic chemistry.' },
         { name: 'Chemistry Part C', count: 15, marks: 60, topics: 'Chemistry', instructions: '15 Chemistry questions. Each 4 marks. Total: 60. Inorganic chemistry.' },
-        { name: 'Biology Part A', count: 20, marks: 80, topics: 'Biology', instructions: '20 Biology questions (Botany + Zoology). Each 4 marks. Total: 80.' },
-        { name: 'Biology Part B', count: 20, marks: 80, topics: 'Biology', instructions: '20 Biology questions. Each 4 marks. Total: 80.' },
-        { name: 'Biology Part C', count: 20, marks: 80, topics: 'Biology', instructions: '20 Biology questions. Each 4 marks. Total: 80.' },
-        { name: 'Biology Part D', count: 20, marks: 80, topics: 'Biology', instructions: '20 Biology questions. Each 4 marks. Total: 80.' }
+        { name: 'Biology Part A', count: 23, marks: 92, topics: 'Biology', instructions: '23 Biology questions (Botany + Zoology). Each 4 marks. Total: 92.' },
+        { name: 'Biology Part B', count: 23, marks: 92, topics: 'Biology', instructions: '23 Biology questions (Botany + Zoology). Each 4 marks. Total: 92.' },
+        { name: 'Biology Part C', count: 22, marks: 88, topics: 'Biology', instructions: '22 Biology questions (Botany + Zoology). Each 4 marks. Total: 88.' },
+        { name: 'Biology Part D', count: 22, marks: 88, topics: 'Biology', instructions: '22 Biology questions (Botany + Zoology). Each 4 marks. Total: 88.' }
       ]
     },
     'JEE': {
