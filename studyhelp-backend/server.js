@@ -417,14 +417,14 @@ function getExamBatchPlan(examName) {
       totalMarks: 200,
       duration: 120,
       batches: [
-        { name: 'Math Part A', count: 15, marks: 20, topics: 'Mathematics', instructions: '15 Math questions. Mix of 1-mark and 2-mark. Total: ~20.' },
-        { name: 'Math Part B', count: 15, marks: 20, topics: 'Mathematics', instructions: '15 Math questions. Mix of 1-mark and 2-mark. Total: ~20.' },
-        { name: 'Math Part C', count: 15, marks: 20, topics: 'Mathematics', instructions: '15 Math questions. Mix of 1-mark and 2-mark. Total: ~20.' },
-        { name: 'Math Part D', count: 15, marks: 20, topics: 'Mathematics', instructions: '15 Math questions. Mix of 1-mark and 2-mark. Total: ~20.' },
-        { name: 'Physics Part A', count: 15, marks: 20, topics: 'Physics', instructions: '15 Physics questions. Mix of 1-mark and 2-mark. Total: ~20.' },
-        { name: 'Physics Part B', count: 15, marks: 20, topics: 'Physics', instructions: '15 Physics questions. Mix of 1-mark and 2-mark. Total: ~20.' },
-        { name: 'Chemistry Part A', count: 15, marks: 20, topics: 'Chemistry', instructions: '15 Chemistry questions. Mix of 1-mark and 2-mark. Total: ~20.' },
-        { name: 'Chemistry Part B', count: 15, marks: 20, topics: 'Chemistry', instructions: '15 Chemistry questions. Mix of 1-mark and 2-mark. Total: ~20.' }
+        { name: 'Math Part A', count: 19, marks: 25, topics: 'Mathematics', instructions: '19 Math questions. Mix of 1-mark and 2-mark. Total: ~25 marks.' },
+        { name: 'Math Part B', count: 19, marks: 25, topics: 'Mathematics', instructions: '19 Math questions. Mix of 1-mark and 2-mark. Total: ~25 marks.' },
+        { name: 'Math Part C', count: 19, marks: 25, topics: 'Mathematics', instructions: '19 Math questions. Mix of 1-mark and 2-mark. Total: ~25 marks.' },
+        { name: 'Math Part D', count: 18, marks: 25, topics: 'Mathematics', instructions: '18 Math questions. Mix of 1-mark and 2-mark. Total: ~25 marks.' },
+        { name: 'Physics Part A', count: 20, marks: 25, topics: 'Physics', instructions: '20 Physics questions. Mix of 1-mark and 2-mark. Total: ~25 marks.' },
+        { name: 'Physics Part B', count: 20, marks: 25, topics: 'Physics', instructions: '20 Physics questions. Mix of 1-mark and 2-mark. Total: ~25 marks.' },
+        { name: 'Chemistry Part A', count: 20, marks: 25, topics: 'Chemistry', instructions: '20 Chemistry questions. Mix of 1-mark and 2-mark. Total: ~25 marks.' },
+        { name: 'Chemistry Part B', count: 20, marks: 25, topics: 'Chemistry', instructions: '20 Chemistry questions. Mix of 1-mark and 2-mark. Total: ~25 marks.' }
       ]
     }
   };
