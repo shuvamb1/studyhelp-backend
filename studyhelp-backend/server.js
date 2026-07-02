@@ -461,11 +461,13 @@ RULES:
 - Return ONLY a valid JSON array. NO markdown, NO code blocks, NO extra text.
 - CRITICAL: generate EXACTLY ${batch.count} questions. Not fewer.
 - CRITICAL: Do NOT include A, B, C, D labels, prefixes, or markers in the option text. Each option must be plain text only. Never return placeholder text like "A", "B", "C", "D" as option values.
+- CRITICAL: ALL questions MUST be based on topics from the syllabus below. Do NOT generate questions on topics outside the syllabus.
+- Study the PYQ pattern to match the style and difficulty of real exam questions.
 
-PYQ CONTENT (study pattern and difficulty):
+PYQ CONTENT (study pattern, question style, and difficulty):
 ${pyqText || 'No PYQ content provided.'}
 
-SYLLABUS (cover evenly):
+SYLLABUS CONTENT (strictly follow these topics — generate questions ONLY from topics covered in the syllabus):
 ${syllabusText || 'No syllabus provided.'}
 
 JSON FORMAT (return ONLY this array):
@@ -734,6 +736,8 @@ async function generateCompetitiveQuestionsFromExam(config, totalMarks, duration
     if (combinedPyqText.length > MAX_CHARS) combinedPyqText = combinedPyqText.substring(0, MAX_CHARS) + '\n\n[Truncated...]';
     let combinedSyllabusText = syllabusText;
     if (combinedSyllabusText.length > MAX_CHARS) combinedSyllabusText = combinedSyllabusText.substring(0, MAX_CHARS) + '\n\n[Truncated...]';
+
+    console.log(`[Competitive Mock] Content loaded — PYQ: ${combinedPyqText.length} chars, Syllabus: ${combinedSyllabusText.length} chars`);
 
     console.log(`[Competitive Mock] Starting PARALLEL generation for ${config.examName} with ${AI_API_MOCK_KEYS.length} key(s). ${plan.batches.length} batches. Model: llama-3.1-8b-instant.`);
     const startTime = Date.now();
