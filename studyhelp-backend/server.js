@@ -303,8 +303,6 @@ const MockTestResult = mongoose.model('MockTestResult', mockTestResultSchema);
 const testSessionSchema = new mongoose.Schema({
   paperId: { type: mongoose.Schema.Types.ObjectId, ref: 'MockTestPaper', required: true },
   userId: String,
-  status: { type: String, enum: ['generating', 'ready', 'failed'], default: 'generating' },
-  error: String,
   questions: [{
     question: String,
     options: [String],
@@ -348,8 +346,6 @@ const CompetitiveExamConfig = mongoose.model('CompetitiveExamConfig', competitiv
 const competitiveTestSessionSchema = new mongoose.Schema({
   examName: { type: String, enum: ['NEET', 'JEE', 'GATE', 'WBJEE'], required: true },
   userId: String,
-  status: { type: String, enum: ['generating', 'ready', 'failed'], default: 'generating' },
-  error: String,
   questions: [{
     question: String,
     options: [String],
@@ -1156,9 +1152,18 @@ app.get('/api/mock-tests/:paperId/previous-result', authMiddleware, async (req, 
   }
 });
 
-// ========== REGULAR MOCK TEST AI GENERATION HELPER ==========
-async function generateMockTestQuestions(paper, totalMarks, testDuration, qType, targetDifficulty) {
+// POST /api/mock-tests/:paperId/start — generate AI questions for a regular mock test
+app.post('/api/mock-tests/:paperId/start', authMiddleware, async (req, res) => {
   try {
+    const { paperId } = req.params;
+    const { marks, duration, questionType, targetDifficulty } = req.body;
+    const totalMarks = Number(marks) || 30;
+    const testDuration = Number(duration) || 60;
+    const qType = questionType || 'mcq';
+
+    const paper = await MockTestPaper.findById(paperId);
+    if (!paper) return res.status(404).json({ error: 'Paper not found' });
+
     // Extract text from PYQ PDFs
     let pdfText = '';
     if (paper.pdfFiles && paper.pdfFiles.length > 0) {
@@ -1185,7 +1190,7 @@ async function generateMockTestQuestions(paper, totalMarks, testDuration, qType,
     }
 
     if (!pdfText && !syllabusText) {
-      return { success: false, error: 'No PDF or syllabus content available for this paper.' };
+      return res.status(400).json({ error: 'No PDF or syllabus content available for this paper.' });
     }
 
     const MAX_CHARS = 2000;
@@ -1224,108 +1229,33 @@ ${truncatedPyqText ? `PYQ CONTENT (study pattern, question style, and difficulty
 
     // Call Groq API (use regular AI key, fallback to mock key)
     const apiKey = AI_API_KEY || (AI_API_MOCK_KEYS.length > 0 ? AI_API_MOCK_KEYS[0] : '');
-    if (!apiKey) return { success: false, error: 'AI is not configured. Please contact admin.' };
+    if (!apiKey) return res.status(400).json({ error: 'AI is not configured. Please contact admin.' });
 
     const result = await callGroqMock(prompt, apiKey, 4000);
     if (!result.success || !result.content) {
-      return { success: false, error: 'AI question generation failed. Please try again.' };
+      return res.status(500).json({ error: 'AI question generation failed. Please try again.' });
     }
 
     const parsed = parseAIResponse(result.content, { count: 999, marks: 1 });
     if (!parsed.questions || parsed.questions.length === 0) {
-      return { success: false, error: 'No valid questions were generated. Please try again.' };
+      return res.status(500).json({ error: 'No valid questions were generated. Please try again.' });
     }
 
-    return { success: true, questions: parsed.questions };
-  } catch (err) {
-    console.error('generateMockTestQuestions error:', err);
-    return { success: false, error: err.message || 'Unexpected generation error' };
-  }
-}
+    let actualTotalMarks = 0;
+    for (const q of parsed.questions) {
+      actualTotalMarks += q.marks || 1;
+    }
 
-// POST /api/mock-tests/:paperId/start — generate AI questions for a regular mock test (async background)
-app.post('/api/mock-tests/:paperId/start', authMiddleware, async (req, res) => {
-  try {
-    const { paperId } = req.params;
-    const { marks, duration, questionType, targetDifficulty } = req.body;
-    const totalMarks = Number(marks) || 30;
-    const testDuration = Number(duration) || 60;
-    const qType = questionType || 'mcq';
-
-    const paper = await MockTestPaper.findById(paperId);
-    if (!paper) return res.status(404).json({ error: 'Paper not found' });
-
-    // Create session immediately with status 'generating'
     const session = new TestSession({
       paperId,
       userId: req.user.id,
-      status: 'generating',
-      questions: [],
-      totalMarks: 0,
+      questions: parsed.questions,
+      totalMarks: actualTotalMarks,
       duration: testDuration
     });
     await session.save();
 
-    // Start generation in background (don't await — return immediately to client)
-    generateMockTestQuestions(paper, totalMarks, testDuration, qType, targetDifficulty)
-      .then(async (result) => {
-        if (!result.success) {
-          await TestSession.findByIdAndUpdate(session._id, {
-            status: 'failed',
-            error: result.error || 'Question generation failed'
-          });
-          console.error(`[Mock Test] Session ${session._id} generation failed: ${result.error}`);
-          return;
-        }
-        const questions = result.questions;
-        let actualTotalMarks = 0;
-        for (const q of questions) actualTotalMarks += q.marks || 1;
-        await TestSession.findByIdAndUpdate(session._id, {
-          status: 'ready',
-          questions,
-          totalMarks: actualTotalMarks
-        });
-        console.log(`[Mock Test] Session ${session._id} ready — ${questions.length} questions, ${actualTotalMarks} marks`);
-      })
-      .catch(async (err) => {
-        await TestSession.findByIdAndUpdate(session._id, {
-          status: 'failed',
-          error: err.message || 'Unexpected generation error'
-        });
-        console.error(`[Mock Test] Session ${session._id} generation error:`, err);
-      });
-
-    res.json({
-      sessionId: session._id,
-      status: 'generating',
-      message: 'Question generation started. Poll for status.'
-    });
-  } catch (err) {
-    console.error('Start mock test error:', err);
-    res.status(500).json({ error: 'Server error during test generation' });
-  }
-});
-
-// User: Poll regular mock test session status
-app.get('/api/mock-tests/session/:sessionId', authMiddleware, async (req, res) => {
-  try {
-    const { sessionId } = req.params;
-    if (!sessionId) return res.status(400).json({ error: 'Session ID required' });
-    const session = await TestSession.findById(sessionId);
-    if (!session) return res.status(404).json({ error: 'Session not found' });
-    if (session.userId !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-
-    if (session.status === 'failed') {
-      return res.json({ status: 'failed', error: session.error || 'Generation failed' });
-    }
-
-    if (session.status !== 'ready') {
-      return res.json({ status: session.status || 'generating', sessionId: session._id });
-    }
-
-    const clientQuestions = session.questions.map((q, idx) => ({
+    const clientQuestions = parsed.questions.map((q, idx) => ({
       id: idx,
       question: q.question,
       options: q.options || [],
@@ -1335,25 +1265,21 @@ app.get('/api/mock-tests/session/:sessionId', authMiddleware, async (req, res) =
       modelAnswer: q.modelAnswer || ''
     }));
 
-    const paper = await MockTestPaper.findById(session.paperId).select('title subject department semester');
-
     res.json({
-      status: 'ready',
       testId: session._id,
       paper: {
-        title: paper?.title || '',
-        subject: paper?.subject || '',
-        department: paper?.department || '',
-        semester: paper?.semester || ''
+        title: paper.title,
+        subject: paper.subject || '',
+        department: paper.department || '',
+        semester: paper.semester || ''
       },
       questions: clientQuestions,
-      totalMarks: session.totalMarks,
-      duration: session.duration,
-      questionCount: session.questions.length
+      totalMarks: actualTotalMarks,
+      duration: testDuration
     });
   } catch (err) {
-    console.error('Get mock session error:', err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Start mock test error:', err);
+    res.status(500).json({ error: 'Server error during test generation' });
   }
 });
 
@@ -1589,7 +1515,7 @@ app.get('/api/competitive-exams', authMiddleware, async (req, res) => {
   }
 });
 
-// User: Start a competitive mock test (async — returns immediately, polls for result)
+// User: Start a competitive mock test
 app.post('/api/competitive-exams/:examName/start', authMiddleware, async (req, res) => {
   try {
     const { examName } = req.params;
@@ -1602,77 +1528,23 @@ app.post('/api/competitive-exams/:examName/start', authMiddleware, async (req, r
 
     if (!aiMockEnabled) return res.status(400).json({ error: 'AI Mock is not configured.' });
 
-    // Create session immediately with status 'generating'
+    const result = await generateCompetitiveQuestionsFromExam(config, totalMarks, testDuration);
+    if (!result.success) return res.status(500).json({ error: result.error || 'Question generation failed' });
+
+    const questions = result.questions;
+    let actualTotalMarks = 0;
+    for (const q of questions) actualTotalMarks += q.marks;
+
     const session = new CompetitiveTestSession({
       examName,
       userId: req.user.id,
-      status: 'generating',
-      questions: [],
-      totalMarks: 0,
+      questions,
+      totalMarks: actualTotalMarks,
       duration: testDuration
     });
     await session.save();
 
-    // Start generation in background (don't await — return immediately to client)
-    generateCompetitiveQuestionsFromExam(config, totalMarks, testDuration)
-      .then(async (result) => {
-        if (!result.success) {
-          await CompetitiveTestSession.findByIdAndUpdate(session._id, {
-            status: 'failed',
-            error: result.error || 'Question generation failed'
-          });
-          console.error(`[Competitive Mock] Session ${session._id} generation failed: ${result.error}`);
-          return;
-        }
-        const questions = result.questions;
-        let actualTotalMarks = 0;
-        for (const q of questions) actualTotalMarks += q.marks;
-        await CompetitiveTestSession.findByIdAndUpdate(session._id, {
-          status: 'ready',
-          questions,
-          totalMarks: actualTotalMarks
-        });
-        console.log(`[Competitive Mock] Session ${session._id} ready — ${questions.length} questions, ${actualTotalMarks} marks`);
-      })
-      .catch(async (err) => {
-        await CompetitiveTestSession.findByIdAndUpdate(session._id, {
-          status: 'failed',
-          error: err.message || 'Unexpected generation error'
-        });
-        console.error(`[Competitive Mock] Session ${session._id} generation error:`, err);
-      });
-
-    res.json({
-      sessionId: session._id,
-      status: 'generating',
-      message: 'Question generation started. Poll for status.'
-    });
-  } catch (err) {
-    console.error('Start competitive test error:', err);
-    res.status(500).json({ error: 'Server error during test generation' });
-  }
-});
-
-// User: Poll competitive test session status
-app.get('/api/competitive-exams/session/:sessionId', authMiddleware, async (req, res) => {
-  try {
-    const { sessionId } = req.params;
-    if (!sessionId) return res.status(400).json({ error: 'Session ID required' });
-    const session = await CompetitiveTestSession.findById(sessionId);
-    if (!session) return res.status(404).json({ error: 'Session not found' });
-    if (session.userId !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-
-    if (session.status === 'failed') {
-      return res.json({ status: 'failed', error: session.error || 'Generation failed' });
-    }
-
-    if (session.status !== 'ready') {
-      return res.json({ status: session.status, sessionId: session._id });
-    }
-
-    const clientQuestions = session.questions.map((q, idx) => ({
+    const clientQuestions = questions.map((q, idx) => ({
       id: idx,
       question: q.question,
       options: q.options,
@@ -1683,17 +1555,16 @@ app.get('/api/competitive-exams/session/:sessionId', authMiddleware, async (req,
     }));
 
     res.json({
-      status: 'ready',
       testId: session._id,
-      examName: session.examName,
+      examName: config.displayName || examName,
       questions: clientQuestions,
-      totalMarks: session.totalMarks,
-      duration: session.duration,
-      questionCount: session.questions.length
+      totalMarks: actualTotalMarks,
+      duration: testDuration,
+      questionCount: questions.length
     });
   } catch (err) {
-    console.error('Get competitive session error:', err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Start competitive test error:', err);
+    res.status(500).json({ error: 'Server error during test generation' });
   }
 });
 
