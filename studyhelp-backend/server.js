@@ -234,7 +234,9 @@ const materialSchema = new mongoose.Schema({
   title: String,
   type: String,
   url: String,
-  date: String
+  date: String,
+  status: { type: String, default: 'pending' },
+  uploadedBy: { type: String, default: '' }
 }, { strict: false, collection: 'materials' });
 const Material = mongoose.model('Material', materialSchema);
 
@@ -1023,7 +1025,10 @@ seedMaterials();
 // GET /api/materials
 app.get('/api/materials', async (req, res) => {
   try {
-    const materials = await Material.find().sort({ createdAt: -1 });
+    // Only return approved materials + legacy ones without status (backward compat)
+    const materials = await Material.find({
+      $or: [{ status: { $ne: 'pending' } }, { status: { $exists: false } }]
+    }).sort({ createdAt: -1 });
     // Normalize semester values to match frontend filter expectations
     const normalized = materials.map(m => ({
       ...m.toObject(),
@@ -1056,7 +1061,8 @@ app.post('/api/contribute', authMiddleware, async (req, res) => {
       url: driveLink,
       date: new Date().toISOString().split('T')[0],
       description: description || '',
-      status: 'pending'
+      status: 'pending',
+      uploadedBy: req.user.id
     });
     await material.save();
 
@@ -1995,13 +2001,71 @@ app.post('/api/admin/notices', authMiddleware, adminMiddleware, async (req, res)
   }
 });
 
+// GET /api/admin/contributions/pending
 app.get('/api/admin/contributions/pending', authMiddleware, adminMiddleware, async (req, res) => {
-  // Return empty for now - contributions system not fully implemented
-  res.json([]);
+  try {
+    const pendingMaterials = await Material.find({ status: 'pending' }).sort({ createdAt: -1 });
+
+    // Fetch uploader details for each material
+    const uploaderIds = pendingMaterials.map(m => m.uploadedBy).filter(Boolean);
+    const uploaders = await Student.find({ _id: { $in: uploaderIds } }).select('name contributionsCount');
+    const uploaderMap = new Map(uploaders.map(s => [s._id.toString(), s]));
+
+    const enriched = pendingMaterials.map(m => {
+      const obj = m.toObject();
+      const uploader = uploaderMap.get(m.uploadedBy?.toString());
+      if (uploader) {
+        obj.uploadedBy = { name: uploader.name, contributionsCount: uploader.contributionsCount };
+        obj.contributorContributionCount = uploader.contributionsCount;
+      }
+      obj.materialType = m.type || m.materialType || '';
+      obj.driveLink = m.url || m.driveLink || '';
+      return obj;
+    });
+
+    res.json(enriched);
+  } catch (err) {
+    console.error('Pending contributions error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
+// PUT /api/admin/contributions/:id - save edits to a pending contribution
+app.put('/api/admin/contributions/:id', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { title, department, semester, subject, materialType, driveLink, description } = req.body;
+    const updates = {};
+    if (title !== undefined) updates.title = title;
+    if (department !== undefined) updates.department = department;
+    if (semester !== undefined) updates.semester = semester;
+    if (subject !== undefined) updates.subject = subject;
+    if (materialType !== undefined) updates.type = materialType;
+    if (driveLink !== undefined) updates.url = driveLink;
+    if (description !== undefined) updates.description = description;
+
+    const material = await Material.findByIdAndUpdate(req.params.id, updates, { new: true });
+    if (!material) return res.status(404).json({ error: 'Material not found' });
+    res.json({ success: true, material });
+  } catch (err) {
+    console.error('Save contribution error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/admin/contributions/:id/approve
 app.post('/api/admin/contributions/:id/approve', authMiddleware, adminMiddleware, async (req, res) => {
-  res.json({ success: true, message: 'Not implemented yet' });
+  try {
+    const material = await Material.findByIdAndUpdate(
+      req.params.id,
+      { status: 'approved' },
+      { new: true }
+    );
+    if (!material) return res.status(404).json({ error: 'Material not found' });
+    res.json({ success: true, message: 'Material approved and published', material });
+  } catch (err) {
+    console.error('Approve contribution error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 app.get('/api/admin/ai-status', authMiddleware, adminMiddleware, (req, res) => {
