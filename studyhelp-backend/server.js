@@ -956,6 +956,10 @@ app.post('/register', async (req, res) => {
     if (!name || !cin || !roll || !year || !department) {
       return res.status(400).send('All fields are required');
     }
+    const csCinPattern = /^2[3-9]-[24]00-[45]-0[23]-05\d\d$/;
+    if (department === 'cs' && !csCinPattern.test(cin)) {
+      return res.status(400).send('Invalid CIN for Computer Science. Expected format: 2x-y00-z-0a-0m (e.g. 25-400-5-02-0571).');
+    }
     const existing = await Student.findOne({ cin });
     if (existing) return res.status(400).send('CIN already registered');
     const student = new Student({ name, cin, roll, year, department });
