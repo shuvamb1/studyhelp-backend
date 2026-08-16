@@ -957,8 +957,14 @@ app.post('/register', async (req, res) => {
       return res.status(400).send('All fields are required');
     }
     const csCinPattern = /^2[3-9]-[24]00-[45]-0[23]-05\d\d$/;
-    if (department === 'cs' && !csCinPattern.test(cin)) {
-      return res.status(400).send('Invalid CIN for Computer Science. Expected format: 2x-y00-z-0a-0m (e.g. 25-400-5-02-0571).');
+    if (department === 'cs') {
+      if (!csCinPattern.test(cin)) {
+        return res.status(400).send('Invalid CIN for Computer Science. Expected format: 2x-y00-z-0a-0m (e.g. 25-400-5-02-0571).');
+      }
+      const cinM = parseInt(cin.split('-').pop().slice(1), 10);
+      if (Number(roll) !== cinM) {
+        return res.status(400).send('Roll number must match the last part (m) of your CIN (e.g. CIN ending in 0571 → roll 571).');
+      }
     }
     const existing = await Student.findOne({ cin });
     if (existing) return res.status(400).send('CIN already registered');
